@@ -14,7 +14,7 @@ const helmet = require('helmet');
 const compression = require('compression');
 const nodemailer = require('nodemailer');
 const crypto = require('crypto');
-const rateLimit = require('express-rate-limit'); // নতুন: রেট লিমিটিং
+const rateLimit = require('express-rate-limit'); // নিরাপত্তা: রেট লিমিটিং যুক্ত করা হয়েছে
 require('dotenv').config();
 
 // --- গ্লোবাল ভেরিয়েবল ---
@@ -33,12 +33,12 @@ const port = process.env.PORT || 3002;
 const http_server = http.createServer(app);
 const io = new Server(http_server, {
   cors: {
-    origin: "*", // প্রয়োজনে নির্দিষ্ট ডোমেইন দিন
+    origin: "*", // প্রয়োজনে নির্দিষ্ট ডোমেইন সেট করতে পারেন
     methods: ["GET", "POST"]
   }
 });
 
-// --- ১. সিকিউরিটি: রেট লিমিটার সেটআপ (নতুন) ---
+// --- ১. সিকিউরিটি: রেট লিমিটার (অতিরিক্ত রিকোয়েস্ট বন্ধ করতে) ---
 // প্রতি ১ মিনিটে একটি আইপি থেকে সর্বোচ্চ ৬০টি রিকোয়েস্ট
 const apiLimiter = rateLimit({
   windowMs: 1 * 60 * 1000, 
@@ -63,11 +63,13 @@ if (process.env.EMAIL_USER && process.env.EMAIL_PASS) {
   
   mailTransporter.verify((error, success) => {
     if (error) {
-      console.warn('[Nodemailer Error]  :', error.message);
+      console.warn('[Nodemailer Error] ইমেইল কনফিগারেশন সঠিক নয়:', error.message);
     } else {
-      console.log('[Nodemailer Success]  : Email server is ready to take messages');
+      console.log('[Nodemailer Success] ইমেইল সার্ভার প্রস্তুত।');
     }
   });
+} else {
+  console.warn('[Nodemailer Info] EMAIL_USER বা EMAIL_PASS সেট করা নেই।');
 }
 
 // --- Middleware ---
@@ -95,7 +97,7 @@ app.use(express.json());
 app.use(express.urlencoded({ extended: true }));
 app.use(express.static('public'));
 
-// IoT রুটে রেট লিমিটার বসানো হলো
+// IoT রুটে রেট লিমিটার প্রয়োগ
 app.use('/api/esp32p', apiLimiter); 
 app.use('/api/esp32pp', apiLimiter);
 
@@ -113,33 +115,36 @@ const client = new MongoClient(uri);
 async function flushDataBuffer(collection, devicesCollection) {
   if (espDataBuffer.length === 0) return;
 
-  // বাফার থেকে ডাটা আলাদা করা এবং মেইন বাফার খালি করা
   const dataToInsert = [...espDataBuffer];
-  espDataBuffer = []; 
+  espDataBuffer = []; // বাফার খালি করা
 
   console.log(`[Batch Insert] Processing ${dataToInsert.length} documents...`);
 
   try {
-    // ১. ডাটা ইনসার্ট করার চেষ্টা
+    // ১. ডাটা ইনসার্ট
     await collection.insertMany(dataToInsert, { ordered: false });
     
-    // ডাটা সফলভাবে সেভ হলে ক্লায়েন্টদের জানানো
     io.emit('new-data', dataToInsert);
 
     // ২. ডিভাইস স্ট্যাটাস আপডেট (Last Seen)
     const lastSeenUpdates = new Map();
     for (const data of dataToInsert) {
       if (data.uid) {
-        const newTime = data.timestamp || new Date(); 
+        // টাইমস্ট্যাম্প ঠিক করা
+        const newTime = data.timestamp || data.receivedAt || new Date(); 
         const existing = lastSeenUpdates.get(data.uid);
         
         if (!existing || newTime >= existing.time) {
           lastSeenUpdates.set(data.uid, { 
             time: newTime, 
-            data: { 
-              temperature: data.temperature,
-              water_level: data.water_level,
-              rainfall: data.rainfall
+            data: { // লেটেস্ট সেন্সর ডাটা সংরক্ষণ
+               pssensor: data.pssensor,
+               environment: data.environment,
+               rain: data.rain,
+               // ব্যাকওয়ার্ড কম্প্যাটিবিলিটির জন্য আগের ফিল্ডগুলো রাখা হলো
+               temperature: data.temperature || (data.environment && data.environment.temp),
+               water_level: data.water_level,
+               rainfall: data.rainfall
             } 
           });
         }
@@ -165,7 +170,8 @@ async function flushDataBuffer(collection, devicesCollection) {
                 uid: uid,
                 addedAt: new Date(),
                 location: null,
-                name: null
+                name: null,
+                division: null
               }
             },
             upsert: true
@@ -176,20 +182,18 @@ async function flushDataBuffer(collection, devicesCollection) {
       await devicesCollection.bulkWrite(bulkOps, { ordered: false });
       io.emit('device-status-updated', updatedDeviceUIDs);
     }
-    
-    console.log(`[Batch Insert] Success: ${dataToInsert.length} docs saved.`);
+    console.log(`[Batch Insert] Success.`);
 
   } catch (error) {
-    console.error("[Batch Insert] Failed! Restoring data to buffer:", error.message);
-    
-    // [FIX] ফেইল করলে ডাটা বাফারের শুরুতে ফেরত পাঠানো হচ্ছে
+    console.error("[Batch Insert] Failed! Restoring data:", error.message);
+    // [FIX] ফেইল করলে ডাটা বাফারে ফেরত পাঠানো হচ্ছে
     espDataBuffer = [...dataToInsert, ...espDataBuffer];
   }
 }
 
 async function syncAllDevices(EspCollection, devicesCollection) {
-  // এটি একটি ভারী কাজ, তাই শুধুমাত্র প্রয়োজন হলেই চালাবেন
   try {
+    // এই অপারেশনটি ভারী, তাই ইনডেক্স থাকা জরুরি
     const uids = await EspCollection.distinct('uid');
     if (!uids || uids.length === 0) return;
 
@@ -220,7 +224,6 @@ async function syncAllDevices(EspCollection, devicesCollection) {
 async function checkOfflineDevices(devicesCollection) {
   try {
     const thresholdTime = new Date(Date.now() - OFFLINE_THRESHOLD_MS);
-    
     const devicesToUpdate = await devicesCollection.find(
       { status: 'online', lastSeen: { $lt: thresholdTime } },
       { projection: { uid: 1 } }
@@ -250,7 +253,6 @@ function cleanupOldBackupJobs() {
     if ((job.status === 'done' || job.status === 'error') && (NOW - jobTime > MAX_AGE_MS)) {
         if (job.tmpDir) {
           try {
-            // Node 14.14+ এর জন্য recursive delete
             fs.rmSync(job.tmpDir, { recursive: true, force: true });
           } catch(e) {
             console.warn(`[Cleanup] Failed to delete ${job.tmpDir}`, e.message);
@@ -265,7 +267,7 @@ function cleanupOldBackupJobs() {
 async function run() {
   try {
     await client.connect();
-    console.log('MongoDB Connected Successfully');
+    console.log('DB connected');
 
     const db = client.db('Esp32data');
     const EspCollection = db.collection('espdata2'); 
@@ -273,12 +275,10 @@ async function run() {
     const usersCollection = db.collection('users');
 
     // --- [নতুন] পারফরম্যান্সের জন্য ইনডেক্স তৈরি ---
-    // এটি নিশ্চিত করবে যে কোয়েরিগুলো দ্রুত হয়
-    console.log('Ensuring indexes...');
     try {
-        await EspCollection.createIndex({ uid: 1, timestamp: -1 }); // ডাটা গ্রাফের জন্য
-        await devicesCollection.createIndex({ uid: 1 }, { unique: true }); // ডিভাইস লিস্টের জন্য
-        await usersCollection.createIndex({ email: 1 }, { unique: true }); // লগইনের জন্য
+        await EspCollection.createIndex({ uid: 1, timestamp: -1 }); 
+        await devicesCollection.createIndex({ uid: 1 }, { unique: true });
+        await usersCollection.createIndex({ email: 1 }, { unique: true });
     } catch (idxErr) {
         console.warn('Index creation warning:', idxErr.message);
     }
@@ -289,7 +289,7 @@ async function run() {
     setInterval(() => checkOfflineDevices(devicesCollection), CHECK_OFFLINE_INTERVAL_MS);
     setInterval(cleanupOldBackupJobs, 15 * 60 * 1000);
 
-    // স্টার্টআপে একবার সিঙ্ক
+    console.log('Running initial device list sync job on startup...');
     syncAllDevices(EspCollection, devicesCollection);
 
     // অ্যাডমিন চেক হেল্পার
@@ -313,9 +313,9 @@ async function run() {
         data.timestamp = data.timestamp ? new Date(data.timestamp) : new Date();
         data.receivedAt = new Date();
         espDataBuffer.push(data);
-        res.status(200).send({ message: 'Data queued.' });
+        res.status(200).send({ message: 'Data accepted and queued.' });
       } catch (error) {
-        res.status(400).send({ message: 'Invalid data' });
+        res.status(400).send({ message: 'Invalid data format' });
       }
     });
 
@@ -323,11 +323,9 @@ async function run() {
     app.post('/api/esp32p', async (req, res) => {
       try {
         const data = req.body;
-        
-        // সার্ভার রিসিভ টাইম (Bangladesh Standard Time হিসেবে ম্যানুয়াল অ্যাডজাস্টমেন্ট)
-        // দ্রষ্টব্য: এটি 'Fake UTC' তৈরি করে, তবে আপনার আগের লজিক ঠিক রাখার জন্য রাখা হলো।
+        // বাংলাদেশ টাইম লজিক
         const bdTime = new Date(Date.now() + (6 * 60 * 60 * 1000));
-        data.receivedAt = bdTime; 
+        data.receivedAt = bdTime;
 
         if (data.timestamp && typeof data.timestamp === 'string') {
           const isoString = data.timestamp.replace(' ', 'T') + "+06:00";
@@ -337,47 +335,62 @@ async function run() {
         }
 
         espDataBuffer.push(data);
-        res.status(200).send({ message: 'Data queued.' });
+        res.status(200).send({ message: 'Data accepted and queued.' });
       } catch (error) {
         console.error("Error in /api/esp32p:", error.message);
-        res.status(400).send({ message: 'Invalid data' });
+        res.status(400).send({ message: 'Invalid data format' });
       }
     });
 
-    // পাবলিক ডাটা রুট (অপ্টিমাইজড)
+    // পাবলিক ডাটা রুট
+    app.get('/api/esp32', async (req, res) => {
+      const cursor = EspCollection.find({});
+      const Data = await cursor.toArray();
+      res.send(Data);
+    });
+
+    // GET /api/device/data
     app.get('/api/device/data', async (req, res) => {
       try {
         const { uid, limit } = req.query || {};
-        if (!uid) return res.status(400).send({ message: 'UID required' });
-        
         const lim = Math.min(1000, Math.max(1, parseInt(limit, 10) || 300));
-        
-        const docs = await EspCollection.find({ uid: String(uid) })
+        const q = uid ? { uid: String(uid) } : {};
+
+        const docs = await EspCollection.find(q)
           .sort({ timestamp: -1 })
           .limit(lim)
-          .project({ uid: 1, temperature: 1, water_level: 1, rainfall: 1, timestamp: 1, _id: 0 })
+          .project({ uid: 1, pssensor: 1, environment: 1, rain: 1, timestamp: 1, _id: 0 }) // নতুন স্ট্রাকচার অনুযায়ী প্রজেকশন
           .toArray();
 
         return res.send(docs);
       } catch (error) {
-        return res.status(500).send({ message: 'Server Error' });
+        return res.status(500).send({ success: false, message: 'Internal server error' });
       }
     });
 
-    // ডাটা রেঞ্জ রুট
+    // POST /api/device/data-by-range
     app.post('/api/device/data-by-range', async (req, res) => {
         try {
           const { uid, start, end, limit } = req.body || {};
           if (!uid) return res.status(400).send({ success: false, message: 'uid is required' });
   
-          const startDate = start ? new Date(start) : new Date(0);
-          const endDate = end ? new Date(end) : new Date();
+          function parseDate(s, fallback) {
+            if (!s) return fallback;
+            const normalized = String(s).trim().replace(' ', 'T');
+            const d = new Date(normalized);
+            return isNaN(d.getTime()) ? null : d;
+          }
+          
+          const startDate = parseDate(start, new Date(0));
+          const endDate = parseDate(end, new Date());
+          if (!startDate || !endDate) return res.status(400).send({ success: false, message: 'Invalid dates' });
+          
           const lim = Math.min(20000, Math.max(1, parseInt(limit, 10) || 10000));
   
           const docs = await EspCollection.find({ uid: String(uid), timestamp: { $gte: startDate, $lte: endDate } })
             .sort({ timestamp: 1 })
             .limit(lim)
-            .project({ uid: 1, temperature: 1, water_level: 1, rainfall: 1, timestamp: 1, _id: 0 })
+            .project({ uid: 1, pssensor: 1, environment: 1, rain: 1, timestamp: 1, _id: 0 })
             .toArray();
   
           return res.send(docs);
@@ -386,47 +399,36 @@ async function run() {
         }
     });
 
-    // --- ব্যাকআপ রুটস (একই আছে) ---
+    // --- ব্যাকআপ রুটস ---
     app.post('/api/backup/start', async (req, res) => {
         const { uid } = req.body || {};
         const q = uid ? { uid: String(uid) } : {};
         const jobId = randomUUID();
-        
-        // ফোল্ডার তৈরি
         const tmpDir = path.join(os.tmpdir(), `esp-backup-${jobId}`);
-        try { fs.mkdirSync(tmpDir, { recursive: true }); } catch(e){}
-
+        fs.mkdirSync(tmpDir, { recursive: true });
+        
         const jsonPath = path.join(tmpDir, 'espdata.json');
         const zipPath = path.join(tmpDir, 'espdata.zip');
-        const job = { status: 'pending', progress: 0, tmpDir, jsonPath, zipPath, error: null };
+        const job = { status: 'pending', progress: 0, tmpDir, jsonPath, zipPath };
         backupJobs.set(jobId, job);
 
-        // ব্যাকগ্রাউন্ড প্রসেস
         (async () => {
             try {
                 job.status = 'exporting';
+                const total = await EspCollection.countDocuments(q);
                 const out = fs.createWriteStream(jsonPath, { encoding: 'utf8' });
                 out.write('[');
                 let first = true;
                 let written = 0;
-                const total = await EspCollection.countDocuments(q); // মোট সংখ্যা জানা থাকলে প্রগ্রেস ভালো দেখাবে
-
-                const cursor = EspCollection.find(q).sort({ timestamp: 1 });
-                for await (const doc of cursor) {
-                    if (!first) out.write(',');
-                    // মেমরি লিক এড়াতে এবং ফরম্যাট ঠিক রাখতে
-                    const cleanDoc = {
-                        uid: doc.uid,
-                        temperature: doc.temperature,
-                        water_level: doc.water_level,
-                        rainfall: doc.rainfall,
-                        timestamp: doc.timestamp,
-                        receivedAt: doc.receivedAt
-                    };
-                    out.write(JSON.stringify(cleanDoc));
+                
+                for await (const doc of EspCollection.find(q).sort({ timestamp: 1 })) {
+                    if (!first) out.write(',\n');
+                    const copy = { ...doc };
+                    if (copy._id) copy._id = copy._id.toString();
+                    out.write(JSON.stringify(copy));
                     first = false;
                     written++;
-                    if (total > 0) job.progress = Math.floor((written / total) * 90); // ৯০% পর্যন্ত এক্সপোর্ট
+                    if (total > 0) job.progress = Math.floor((written / total) * 90);
                 }
                 out.write(']');
                 out.end();
@@ -447,7 +449,6 @@ async function run() {
                 console.error('Backup Error:', err);
                 job.status = 'error';
                 job.error = err.message;
-                job.finishedAt = new Date();
             }
         })();
 
@@ -456,7 +457,7 @@ async function run() {
 
     app.get('/api/backup/status/:jobId', (req, res) => {
         const job = backupJobs.get(req.params.jobId);
-        if (!job) return res.status(404).send('Not found');
+        if (!job) return res.status(404).send({message: 'Job not found'});
         
         res.setHeader('Content-Type', 'text/event-stream');
         res.setHeader('Cache-Control', 'no-cache');
@@ -465,8 +466,7 @@ async function run() {
         const iv = setInterval(() => {
             const j = backupJobs.get(req.params.jobId);
             if (!j) { clearInterval(iv); return res.end(); }
-            
-            res.write(`data: ${JSON.stringify({ status: j.status, progress: j.progress })}\n\n`);
+            res.write(`data: ${JSON.stringify({ status: j.status, progress: j.progress, error: j.error })}\n\n`);
             if (j.status === 'done' || j.status === 'error') {
                 clearInterval(iv);
                 res.end();
@@ -478,7 +478,10 @@ async function run() {
     app.get('/api/backup/download/:jobId', (req, res) => {
         const job = backupJobs.get(req.params.jobId);
         if (!job || job.status !== 'done') return res.status(400).send('Not ready');
-        res.download(job.zipPath);
+        res.download(job.zipPath, 'espdata.zip', () => {
+            try { fs.rmSync(job.tmpDir, { recursive: true, force: true }); } catch(e){}
+            backupJobs.delete(req.params.jobId);
+        });
     });
 
     // --- ইউজার অথেন্টিকেশন রুটস ---
@@ -491,9 +494,9 @@ async function run() {
             const exists = await usersCollection.findOne({ email: normalizedEmail });
             if (exists) return res.status(400).send({ success: false, message: 'Email taken' });
 
-            const passwordHash = await bcrypt.hash(password, 10);
+            const passwordHash = await bcrypt.hash(String(password), 10);
             await usersCollection.insertOne({
-                name, email: normalizedEmail, passwordHash, devices: [], createdAt: new Date()
+                name: String(name).trim(), email: normalizedEmail, passwordHash, devices: [], createdAt: new Date(), address: null, mobile: null
             });
             res.send({ success: true, message: 'Registered' });
         } catch (e) {
@@ -503,21 +506,22 @@ async function run() {
 
     app.post('/api/user/login', async (req, res) => {
         const { email, password } = req.body || {};
+        if (!email || !password) return res.status(400).send({ success: false });
+        
         const user = await usersCollection.findOne({ email: String(email).toLowerCase() });
-        if (!user || !(await bcrypt.compare(password, user.passwordHash))) {
+        if (!user || !(await bcrypt.compare(String(password), user.passwordHash))) {
             return res.status(401).send({ success: false, message: 'Invalid credentials' });
         }
-        const token = jwt.sign({ userId: user._id, email: user.email }, JWT_SECRET, { expiresIn: '7d' });
+        const token = jwt.sign({ userId: user._id.toString(), email: user.email }, JWT_SECRET, { expiresIn: '7d' });
         res.send({ success: true, token });
     });
 
-    // Forgot Password
     app.post('/api/user/password/forgot', async (req, res) => {
         if (!mailTransporter) return res.status(500).send({ success: false, message: 'Email config missing' });
         const { email } = req.body;
         const user = await usersCollection.findOne({ email: String(email).toLowerCase() });
         if (user) {
-            const newPass = crypto.randomBytes(4).toString('hex');
+            const newPass = crypto.randomBytes(6).toString('hex');
             await usersCollection.updateOne({ _id: user._id }, { $set: { passwordHash: await bcrypt.hash(newPass, 10) } });
             mailTransporter.sendMail({
                 to: user.email,
@@ -534,12 +538,30 @@ async function run() {
         res.send(list);
     });
 
+    app.post('/api/user/device/add', authenticateJWT, async (req, res) => {
+        const { uid } = req.body;
+        if (!uid) return res.status(400).send({ message: 'UID needed' });
+        await usersCollection.updateOne(
+            { _id: new ObjectId(req.user.userId) },
+            { $addToSet: { devices: String(uid).trim() } }
+        );
+        res.send({ success: true, message: 'Device added' });
+    });
+
+    app.delete('/api/user/device/remove', authenticateJWT, async (req, res) => {
+        const { uid } = req.body;
+        await usersCollection.updateOne(
+            { _id: new ObjectId(req.user.userId) },
+            { $pull: { devices: String(uid).trim() } }
+        );
+        res.send({ success: true, message: 'Device removed' });
+    });
+
     app.get('/api/user/devices', authenticateJWT, async (req, res) => {
         const user = await usersCollection.findOne({ _id: new ObjectId(req.user.userId) });
         if (!user || !user.devices) return res.send([]);
         
         const devices = await devicesCollection.find({ uid: { $in: user.devices } }).toArray();
-        // ডাটা ফরম্যাটিং
         const result = user.devices.map(uid => {
             const d = devices.find(x => x.uid === uid);
             return {
@@ -554,29 +576,27 @@ async function run() {
         res.send(result);
     });
 
-    app.post('/api/user/device/add', authenticateJWT, async (req, res) => {
-        const { uid } = req.body;
-        if (!uid) return res.status(400).send({ message: 'UID needed' });
-        await usersCollection.updateOne(
-            { _id: new ObjectId(req.user.userId) },
-            { $addToSet: { devices: String(uid).trim() } }
-        );
-        res.send({ success: true });
-    });
+    app.get('/api/user/device/:uid/data', authenticateJWT, async (req, res) => {
+        const user = await usersCollection.findOne({ _id: new ObjectId(req.user.userId) });
+        if (!user.devices.includes(req.params.uid)) return res.status(403).send({ message: 'Forbidden' });
+        
+        const { limit } = req.query;
+        const lim = Math.min(5000, Math.max(1, parseInt(limit, 10) || 500));
+        // শেষ ২৪ ঘন্টার ডাটা ডিফল্ট
+        const endDate = new Date();
+        const startDate = new Date(endDate.getTime() - (24 * 60 * 60 * 1000));
 
-    app.delete('/api/user/device/remove', authenticateJWT, async (req, res) => {
-        const { uid } = req.body;
-        await usersCollection.updateOne(
-            { _id: new ObjectId(req.user.userId) },
-            { $pull: { devices: String(uid).trim() } }
-        );
-        res.send({ success: true });
+        const docs = await EspCollection.find({ uid: req.params.uid, timestamp: { $gte: startDate, $lte: endDate } })
+            .sort({ timestamp: -1 })
+            .limit(lim)
+            .project({ pssensor: 1, environment: 1, rain: 1, timestamp: 1, _id: 0 })
+            .toArray();
+        res.send(docs.reverse());
     });
 
     app.get('/api/user/profile', authenticateJWT, async (req, res) => {
         const user = await usersCollection.findOne({ _id: new ObjectId(req.user.userId) }, { projection: { passwordHash: 0 } });
         if (!user) return res.status(404).send('User not found');
-        
         const isAdminEnv = process.env.ADMIN_EMAIL && user.email === process.env.ADMIN_EMAIL;
         user.isAdmin = (user.isAdmin === true || isAdminEnv);
         res.send(user);
@@ -593,7 +613,44 @@ async function run() {
         res.send({ success: true });
     });
 
+    app.post('/api/user/password/change', authenticateJWT, async (req, res) => {
+        const { oldPassword, newPassword } = req.body;
+        const user = await usersCollection.findOne({ _id: new ObjectId(req.user.userId) });
+        if (!await bcrypt.compare(oldPassword, user.passwordHash)) return res.status(401).send({ message: 'Invalid old password' });
+        
+        await usersCollection.updateOne({ _id: user._id }, { $set: { passwordHash: await bcrypt.hash(newPassword, 10) } });
+        res.send({ success: true, message: 'Password changed' });
+    });
+
     // --- অ্যাডমিন রুটস ---
+    app.post('/api/filter/device', authenticateJWT, async (req, res) => {
+        const check = await ensureAdmin(req, res);
+        if (!check?.ok) return;
+        await syncAllDevices(EspCollection, devicesCollection);
+        res.send({ success: true });
+    });
+
+    // [গুরুত্বপূর্ণ] Division সহ আপডেট লজিক (আপনার দেওয়া কোড অনুযায়ী)
+    app.put('/api/device/:uid', authenticateJWT, async (req, res) => {
+        const check = await ensureAdmin(req, res);
+        if (!check?.ok) return;
+
+        const { uid } = req.params;
+        const { location, name, latitude, longitude, division } = req.body; // Division যুক্ত
+
+        const updateFields = {};
+        if (location !== undefined) updateFields.location = location;
+        if (name !== undefined) updateFields.name = name;
+        if (latitude !== undefined) updateFields.latitude = latitude;
+        if (longitude !== undefined) updateFields.longitude = longitude;
+        if (division !== undefined) updateFields.division = division;
+
+        if (Object.keys(updateFields).length === 0) return res.status(400).send({ message: 'No fields' });
+
+        const result = await devicesCollection.updateOne({ uid }, { $set: updateFields });
+        res.send({ success: true, message: result.matchedCount ? 'Updated' : 'Not found' });
+    });
+
     app.get('/api/admin/stats', authenticateJWT, async (req, res) => {
         const check = await ensureAdmin(req, res);
         if (!check?.ok) return;
@@ -607,23 +664,27 @@ async function run() {
         res.send({ totalDevices: totalDev, onlineDevices: onlineDev, offlineDevices: totalDev - onlineDev, totalDataPoints: totalData });
     });
 
-    app.put('/api/device/:uid', authenticateJWT, async (req, res) => {
-        const check = await ensureAdmin(req, res);
-        if (!check?.ok) return;
-
-        const { location, name, latitude, longitude, division } = req.body;
-        await devicesCollection.updateOne(
-            { uid: req.params.uid },
-            { $set: { location, name, latitude, longitude, division } }
-        );
-        res.send({ success: true });
-    });
-
     app.get('/api/admin/users', authenticateJWT, async (req, res) => {
         const check = await ensureAdmin(req, res);
         if (!check?.ok) return;
         const users = await usersCollection.find({}, { projection: { passwordHash: 0 } }).toArray();
         res.send(users);
+    });
+
+    app.post('/api/admin/user/make-admin', authenticateJWT, async (req, res) => {
+        const check = await ensureAdmin(req, res);
+        if (!check?.ok) return;
+        await usersCollection.updateOne({ email: req.body.email }, { $set: { isAdmin: true } });
+        res.send({ success: true });
+    });
+
+    app.post('/api/admin/user/remove-admin', authenticateJWT, async (req, res) => {
+        const check = await ensureAdmin(req, res);
+        if (!check?.ok) return;
+        if (req.body.email === process.env.ADMIN_EMAIL) return res.status(403).send({ message: 'Cannot remove super admin' });
+        
+        await usersCollection.updateOne({ email: req.body.email }, { $set: { isAdmin: false } });
+        res.send({ success: true });
     });
 
   } catch (err) {
@@ -641,5 +702,5 @@ app.get("/", (req, res) => {
 // সার্ভার চালু
 http_server.listen(port, () => {
   console.log(`Max it Production server running at: ${port}`);
+  console.log(`Current server time: ${new Date().toLocaleString('en-US', { timeZone: 'Asia/Dhaka' })} (Asia/Dhaka)`);
 });
- 
