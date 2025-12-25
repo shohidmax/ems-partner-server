@@ -1,3 +1,4 @@
+
 const express = require('express');
 const cors = require('cors');
 const jwt = require('jsonwebtoken');
@@ -306,36 +307,27 @@ iotRouter.post('/esp32p', (req, res) => { // BD Time Zone হ্যান্ড�
 // ২. পাবলিক ডাটা API
 const publicRouter = express.Router();
 
-publicRouter.get('/device/data', async (req, res) => {
+publicRouter.post('/device/data-by-range', async (req, res) => {
     try {
-        const { uid, limit } = req.query;
-        const lim = Math.min(1000, parseInt(limit) || 300);
-        const query = uid ? { uid: String(uid) } : {};
-        
-        const data = await req.db.collection('espdata2')
-            .find(query)
-            .sort({ timestamp: -1 })
-            .limit(lim)
-            .project({ 
-                _id: 0, 
-                uid: 1, 
-                timestamp: 1,
-                // নতুন ফিল্ডগুলো প্রোজেকশনে যোগ করা
-                version: 1,
-                pssensor: 1, 
-                environment: 1, 
-                rain: 1,
-                dateTime: 1,
-                // পুরোনো ফিল্ডগুলো (যদি ডাটাবেসে থাকে)
-                temperature: 1, 
-                water_level: 1, 
-                rainfall: 1
-            })
-            .toArray();
-            
-        res.send(data);
-    } catch (e) { res.status(500).send({ error: e.message }); }
+        const { uid, start, end, limit } = req.body || {};
+        if (!uid) return res.status(400).send({ success: false, message: 'uid is required' });
+
+        const startDate = start ? new Date(start) : new Date(0);
+        const endDate = end ? new Date(end) : new Date();
+        const lim = Math.min(20000, Math.max(1, parseInt(limit, 10) || 10000));
+
+        const docs = await req.db.collection('espdata2').find({ uid: String(uid), timestamp: { $gte: startDate, $lte: endDate } })
+          .sort({ timestamp: 1 })
+          .limit(lim)
+          .project({ uid: 1, pssensor: 1, environment: 1, rain: 1, timestamp: 1, dateTime: 1, temperature: 1, water_level: 1, rainfall: 1, _id: 0 })
+          .toArray();
+
+        return res.send(docs);
+    } catch (error) {
+        return res.status(500).send({ success: false, message: 'Server error' });
+    }
 });
+
 
 // ৩. অথেন্টিকেশন রাউটস
 const authRouter = express.Router();
@@ -398,6 +390,28 @@ authRouter.post('/password/forgot', async (req, res) => {
     } catch (e) { res.status(500).send({ error: e.message }); }
 });
 
+
+authRouter.post('/password/change', authenticateJWT, async (req, res) => {
+    try {
+        const { oldPassword, newPassword } = req.body;
+        if (!oldPassword || !newPassword) return res.status(400).send({ message: "Old and new passwords are required." });
+
+        const user = await req.db.collection('users').findOne({ _id: new ObjectId(req.user.userId) });
+        if (!user) return res.status(404).send({ message: "User not found." });
+
+        const isMatch = await bcrypt.compare(oldPassword, user.passwordHash);
+        if (!isMatch) return res.status(401).send({ message: "Invalid old password." });
+        
+        const newPasswordHash = await bcrypt.hash(newPassword, 10);
+        await req.db.collection('users').updateOne({ _id: user._id }, { $set: { passwordHash: newPasswordHash } });
+
+        res.send({ success: true, message: 'Password changed successfully.' });
+    } catch (e) {
+        res.status(500).send({ error: e.message });
+    }
+});
+
+
 // ৪. ইউজার প্রোটেক্টেড রাউটস
 const userRouter = express.Router();
 userRouter.use(authenticateJWT);
@@ -407,6 +421,26 @@ userRouter.get('/profile', async (req, res) => {
     if(user) user.isAdmin = user.isAdmin || (process.env.ADMIN_EMAIL === user.email);
     res.send(user || {});
 });
+
+userRouter.post('/profile/update', async (req, res) => {
+    try {
+        const { name, address, mobile } = req.body;
+        const updateFields = {};
+        if (name) updateFields.name = name;
+        if (address) updateFields.address = address;
+        if (mobile) updateFields.mobile = mobile;
+
+        if (Object.keys(updateFields).length === 0) {
+            return res.status(400).send({ message: "No fields to update." });
+        }
+        
+        await req.db.collection('users').updateOne({ _id: new ObjectId(req.user.userId) }, { $set: updateFields });
+        res.send({ success: true, message: "Profile updated." });
+    } catch (e) {
+        res.status(500).send({ error: e.message });
+    }
+});
+
 
 userRouter.get('/devices', async (req, res) => {
     const user = await req.db.collection('users').findOne({ _id: new ObjectId(req.user.userId) });
@@ -436,10 +470,39 @@ adminRouter.get('/stats', async (req, res) => {
         totalDevices: await req.db.collection('devices').countDocuments(),
         onlineDevices: await req.db.collection('devices').countDocuments({ status: 'online' }),
         totalUsers: await req.db.collection('users').countDocuments(),
-        dbSize: 'Calculating...' 
     };
     res.send(stats);
 });
+
+adminRouter.get('/devices', async (req, res) => {
+    try {
+        const devices = await req.db.collection('devices').find({}).toArray();
+        const allDeviceUIDs = devices.map(d => d.uid);
+
+        const users = await req.db.collection('users').find(
+            { devices: { $in: allDeviceUIDs } },
+            { projection: { _id: 1, name: 1, email: 1, devices: 1 } }
+        ).toArray();
+
+        const userMap = new Map();
+        users.forEach(user => {
+            user.devices.forEach(uid => {
+                if (!userMap.has(uid)) userMap.set(uid, []);
+                userMap.get(uid).push({ _id: user._id, name: user.name, email: user.email });
+            });
+        });
+
+        const result = devices.map(device => ({
+            ...device,
+            owners: userMap.get(device.uid) || []
+        }));
+
+        res.send(result);
+    } catch (error) {
+        res.status(500).send({ success: false, message: 'Internal server error' });
+    }
+});
+
 
 // ডিভাইস আপডেট করার জন্য নতুন রাউট
 adminRouter.put('/device/:uid', async (req, res) => {
@@ -478,11 +541,188 @@ adminRouter.put('/device/:uid', async (req, res) => {
     }
 });
 
+
+adminRouter.get('/users', async (req, res) => {
+    const users = await req.db.collection('users').find({}, { projection: { passwordHash: 0 } }).toArray();
+    res.send(users);
+});
+
+
+adminRouter.post('/user/make-admin', async (req, res) => {
+    await req.db.collection('users').updateOne({ email: req.body.email }, { $set: { isAdmin: true } });
+    res.send({ success: true, message: 'User promoted to Admin' });
+});
+
+adminRouter.post('/user/remove-admin', async (req, res) => {
+    if (req.body.email === process.env.ADMIN_EMAIL) return res.status(403).send({ message: 'Cannot remove super admin' });
+    await req.db.collection('users').updateOne({ email: req.body.email }, { $set: { isAdmin: false } });
+    res.send({ success: true, message: 'Admin privileges removed' });
+});
+
+
+adminRouter.get('/report', async (req, res) => {
+    const { period = 'monthly', year = new Date().getFullYear().toString() } = req.query;
+    let group, sort;
+    const matchYear = parseInt(year, 10);
+
+    switch (period) {
+        case 'daily':
+            group = {
+                _id: { $dateToString: { format: '%Y-%m-%d', date: '$timestamp', timeZone: 'Asia/Dhaka' } },
+                avgTemp: { $avg: '$environment.temp' },
+                avgRain: { $sum: '$rain.mm' },
+                count: { $sum: 1 }
+            };
+            sort = { '_id': 1 };
+            break;
+        case 'yearly':
+            group = {
+                _id: { $year: { date: '$timestamp', timeZone: 'Asia/Dhaka' } },
+                avgTemp: { $avg: '$environment.temp' },
+                avgRain: { $sum: '$rain.mm' },
+                count: { $sum: 1 }
+            };
+            sort = { '_id': 1 };
+            break;
+        case 'monthly':
+        default:
+            group = {
+                _id: { $dateToString: { format: '%Y-%m', date: '$timestamp', timeZone: 'Asia/Dhaka' } },
+                avgTemp: { $avg: '$environment.temp' },
+                avgRain: { $sum: '$rain.mm' },
+                count: { $sum: 1 }
+            };
+            sort = { '_id': 1 };
+    }
+
+    try {
+        const data = await req.db.collection('espdata2').aggregate([
+            { $match: { 
+                timestamp: { 
+                    $gte: new Date(matchYear, 0, 1), 
+                    $lt: new Date(matchYear + 1, 0, 1)
+                },
+                'environment.temp': { $ne: 85 } // Ignore error value
+            } },
+            { $group: group },
+            { $sort: sort },
+            { $project: {
+                _id: 0,
+                date: period === 'daily' ? '$_id' : undefined,
+                month: period === 'monthly' ? '$_id' : undefined,
+                year: period === 'yearly' ? '$_id' : undefined,
+                avgTemp: 1,
+                avgRain: 1,
+                count: 1
+            }}
+        ]).toArray();
+        res.json(data);
+    } catch (e) {
+        res.status(500).send({ error: e.message });
+    }
+});
+
+adminRouter.post('/backup/start', async (req, res) => {
+    const { uid } = req.body;
+    const q = uid ? { uid: String(uid) } : {};
+    const jobId = randomUUID();
+    const tmpDir = path.join(os.tmpdir(), `esp-backup-${jobId}`);
+    fs.mkdirSync(tmpDir, { recursive: true });
+    
+    const job = { status: 'pending', progress: 0, tmpDir, zipPath: path.join(tmpDir, 'espdata.zip') };
+    backupJobs.set(jobId, job);
+
+    res.send({ jobId });
+
+    (async () => {
+        try {
+            job.status = 'exporting';
+            const total = await req.db.collection('espdata2').countDocuments(q);
+            const out = fs.createWriteStream(path.join(tmpDir, 'espdata.json'), { encoding: 'utf8' });
+            out.write('[');
+            let first = true, written = 0;
+            for await (const doc of req.db.collection('espdata2').find(q).sort({ timestamp: 1 })) {
+                if (!first) out.write(',');
+                // Clean Output
+                const clean = { 
+                    uid: doc.uid, timestamp: doc.timestamp, dateTime: doc.dateTime,
+                    pssensor: doc.pssensor, environment: doc.environment, rain: doc.rain
+                };
+                out.write(JSON.stringify(clean));
+                first = false; written++;
+                if (total > 0) job.progress = Math.floor((written / total) * 90);
+            }
+            out.write(']'); out.end();
+            await new Promise(r => out.on('finish', r));
+
+            job.status = 'zipping';
+            const output = fs.createWriteStream(job.zipPath);
+            const archive = archiver('zip', { zlib: { level: 9 } });
+            archive.pipe(output);
+            archive.file(path.join(tmpDir, 'espdata.json'), { name: 'espdata.json' });
+            await archive.finalize();
+            await new Promise(r => output.on('close', r));
+
+            job.status = 'done'; job.progress = 100; job.finishedAt = new Date();
+             const downloadPath = `/api/admin/backup/download/${jobId}`;
+             job.downloadUrl = downloadPath; 
+
+        } catch (err) { job.status = 'error'; job.error = err.message; job.finishedAt = new Date(); }
+    })();
+});
+
+adminRouter.get('/backup/status/:jobId', (req, res) => {
+    const job = backupJobs.get(req.params.jobId);
+    if(!job) return res.status(404).send({message: 'Not found'});
+    
+    res.setHeader('Content-Type', 'text/event-stream');
+    res.setHeader('Cache-Control', 'no-cache');
+    res.setHeader('Connection', 'keep-alive');
+
+    const sendEvent = (data) => res.write(`data: ${JSON.stringify(data)}\n\n`);
+
+    sendEvent({ status: job.status, progress: job.progress, error: job.error });
+
+    if (job.status === 'done' || job.status === 'error') {
+        if (job.status === 'done') {
+            sendEvent({ status: 'done', progress: 100, download: job.downloadUrl });
+        }
+        return res.end();
+    }
+
+    const iv = setInterval(() => {
+        const currentJob = backupJobs.get(req.params.jobId);
+        if (!currentJob) {
+            clearInterval(iv);
+            return res.end();
+        }
+        
+        sendEvent({ status: currentJob.status, progress: currentJob.progress, error: currentJob.error });
+        
+        if (currentJob.status === 'done' || currentJob.status === 'error') {
+             if (currentJob.status === 'done') {
+                sendEvent({ status: 'done', progress: 100, download: currentJob.downloadUrl });
+            }
+            clearInterval(iv);
+            res.end();
+        }
+    }, 1000);
+
+    req.on('close', () => clearInterval(iv));
+});
+
+adminRouter.get('/backup/download/:jobId', (req, res) => {
+    const job = backupJobs.get(req.params.jobId);
+    if (!job || job.status !== 'done') return res.status(400).send('Not ready or invalid job ID');
+    res.download(job.zipPath, 'espdata.zip');
+});
+
+
 // --- রাউটার মাউন্টিং ---
-app.use('/api', iotRouter);       // /api/esp32p...
-app.use('/api/public', publicRouter); // /api/public/device/data
-app.use('/api/user', authRouter); // /api/user/login, /register
-app.use('/api/protected', userRouter); // /api/protected/profile (নাম পরিবর্তন করেছি যাতে কনফ্লিক্ট না হয়)
+app.use('/api', iotRouter);
+app.use('/api', publicRouter); 
+app.use('/api/user', authRouter);
+app.use('/api/protected', userRouter);
 app.use('/api/admin', adminRouter);
 
 // রুট রুট
@@ -522,6 +762,6 @@ async function startServer() {
         process.exit(1);
     }
 }
-
+ 
 // স্টার্ট!
 startServer();
