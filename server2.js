@@ -1,0 +1,527 @@
+const express = require('express');
+const cors = require('cors');
+const jwt = require('jsonwebtoken');
+const bcrypt = require('bcryptjs');
+const fs = require('fs');
+const path = require('path');
+const os = require('os');
+const archiver = require('archiver');
+const { randomUUID } = require('crypto');
+const http = require('http');
+const { Server } = require('socket.io');
+const { MongoClient, ObjectId } = require('mongodb');
+const helmet = require('helmet');
+const compression = require('compression');
+const nodemailer = require('nodemailer');
+const crypto = require('crypto');
+require('dotenv').config();
+
+// --- কনফিগারেশন এবং ধ্রুবক ---
+const PORT = process.env.PORT || 3002;
+const JWT_SECRET = process.env.JWT_SECRET || 'default_secret_please_change';
+const MONGODB_URI = process.env.MONGODB_URI;
+
+// টাইমিং কনফিগারেশন
+const BATCH_INTERVAL_MS = 10000;       // ১০ সেকেন্ড
+const DEVICE_SYNC_INTERVAL_MS = 600000; // ১০ মিনিট
+const OFFLINE_CHECK_INTERVAL_MS = 60000; // ১ মিনিট
+const OFFLINE_THRESHOLD_MS = 600000;    // ১০ মিনিট
+
+// গ্লোবাল ভেরিয়েবল
+let db;
+let espDataBuffer = [];
+const backupJobs = new Map();
+
+// --- অ্যাপ ইনিশিয়ালাইজেশন ---
+const app = express();
+const http_server = http.createServer(app);
+const io = new Server(http_server, {
+    cors: { origin: "*" } // Socket.io CORS
+});
+
+// --- ইমেইল ট্রান্সপোর্টার ---
+let mailTransporter;
+if (process.env.EMAIL_USER && process.env.EMAIL_PASS) {
+    mailTransporter = nodemailer.createTransport({
+        host: process.env.EMAIL_HOST || 'smtp.gmail.com',
+        port: parseInt(process.env.EMAIL_PORT || '587'),
+        secure: process.env.EMAIL_SECURE === 'true',
+        auth: {
+            user: process.env.EMAIL_USER,
+            pass: process.env.EMAIL_PASS,
+        },
+    });
+    console.log('[Email] ইমেইল সিস্টেম সক্রিয় আছে।');
+} else {
+    console.warn('[Email] ইমেইল কনফিগারেশন পাওয়া যায়নি।');
+}
+
+// --- মিডলওয়্যার ---
+app.use(helmet());
+app.use(compression());
+app.use(cors());
+app.use(express.json());
+app.use(express.urlencoded({ extended: true }));
+app.use(express.static('public'));
+
+// ডাটাবেস অ্যাটাচমেন্ট মিডলওয়্যার (খুবই গুরুত্বপূর্ণ)
+app.use((req, res, next) => {
+    if (!db) return res.status(503).send({ message: 'Database connecting...' });
+    req.db = db;
+    next();
+});
+
+// --- অথেন্টিকেশন মিডলওয়্যার ---
+const authenticateJWT = (req, res, next) => {
+    const authHeader = req.headers.authorization;
+    if (!authHeader) return res.status(401).send({ success: false, message: 'Authorization header missing' });
+
+    const token = authHeader.split(' ')[1];
+    if (!token) return res.status(401).send({ success: false, message: 'Token missing' });
+
+    jwt.verify(token, JWT_SECRET, (err, user) => {
+        if (err) return res.status(403).send({ success: false, message: 'Invalid token' });
+        req.user = user;
+        next();
+    });
+};
+
+// --- অ্যাডমিন চেক হেল্পার ---
+const ensureAdmin = async (req, res, next) => {
+    try {
+        const user = await req.db.collection('users').findOne({ _id: new ObjectId(req.user.userId) });
+        const isAdminEnv = process.env.ADMIN_EMAIL && user && user.email === process.env.ADMIN_EMAIL;
+        
+        if (user && (user.isAdmin === true || isAdminEnv)) {
+            req.userData = user; // পরবর্তী ব্যবহারের জন্য
+            next();
+        } else {
+            res.status(403).send({ success: false, message: 'Admin access required' });
+        }
+    } catch (error) {
+        res.status(500).send({ success: false, message: 'Internal server error during admin check' });
+    }
+};
+
+// --- হেল্পার ফাংশন: কাস্টম ডেট পার্সার ---
+// ইনপুট: "25-12-2025 05:55:00 AM"
+function parseCustomDateTime(dateStr) {
+    if (!dateStr || typeof dateStr !== 'string') return null;
+    try {
+        const parts = dateStr.split(' '); // ["25-12-2025", "05:55:00", "AM"]
+        if (parts.length < 2) return null;
+
+        const dateParts = parts[0].split('-'); // ["25", "12", "2025"]
+        const timeParts = parts[1].split(':'); // ["05", "55", "00"]
+        
+        if (dateParts.length !== 3 || timeParts.length !== 3) return null;
+
+        let hours = parseInt(timeParts[0], 10);
+        const minutes = parseInt(timeParts[1], 10);
+        const seconds = parseInt(timeParts[2], 10);
+        const modifier = parts[2]; // AM or PM
+
+        if (modifier === 'PM' && hours < 12) hours += 12;
+        if (modifier === 'AM' && hours === 12) hours = 0;
+
+        // Note: Months are 0-indexed in JS Date (0 = Jan, 11 = Dec)
+        return new Date(dateParts[2], parseInt(dateParts[1], 10) - 1, dateParts[0], hours, minutes, seconds);
+    } catch (e) {
+        console.error("Date parsing error:", e);
+        return null;
+    }
+}
+
+// ------------------------------
+// --- ব্যাকগ্রাউন্ড প্রসেস ---
+// ------------------------------
+
+// ১. ব্যাচ ডাটা ইনসার্ট এবং রিয়েল-টাইম আপডেট
+async function processDataBuffer() {
+    if (espDataBuffer.length === 0 || !db) return;
+
+    const dataToInsert = [...espDataBuffer];
+    espDataBuffer = []; // বাফার খালি করা
+
+    const espCollection = db.collection('espdata2');
+    const devicesCollection = db.collection('devices');
+
+    try {
+        // বাল্ক ইনসার্ট
+        await espCollection.insertMany(dataToInsert, { ordered: false });
+        
+        // সকেটে নতুন ডাটা পাঠানো
+        io.emit('new-data', dataToInsert);
+
+        // ডিভাইসের লাস্ট সিন এবং স্ট্যাটাস আপডেট
+        const bulkUpdates = [];
+        const uniqueDevices = new Map();
+
+        // ডুপ্লিকেট এড়িয়ে লেটেস্ট ডাটা বের করা
+        dataToInsert.forEach(d => {
+            if (d.uid) {
+                const ts = new Date(d.timestamp);
+                if (!uniqueDevices.has(d.uid) || ts > uniqueDevices.get(d.uid).timestamp) {
+                    uniqueDevices.set(d.uid, d);
+                }
+            }
+        });
+
+        uniqueDevices.forEach((data, uid) => {
+            // নতুন JSON স্ট্রাকচার অনুযায়ী ডাটা ম্যাপ করা
+            const deviceData = {
+                version: data.version,
+                pssensor: data.pssensor || {},     // { cable, mpa, avg_mpa, depth_ft }
+                environment: data.environment || {}, // { temp, hum }
+                rain: data.rain || {},             // { count, mm }
+                
+                // --- Backward Compatibility (যাতে আগের ফ্রন্টএন্ড না ভাঙ্গে) ---
+                // environment.temp অথবা আগের temperature ফিল্ড
+                temperature: (data.environment && data.environment.temp) !== undefined ? data.environment.temp : data.temperature,
+                // pssensor.depth_ft অথবা আগের water_level ফিল্ড
+                water_level: (data.pssensor && data.pssensor.depth_ft) !== undefined ? data.pssensor.depth_ft : data.water_level,
+                // rain.mm অথবা আগের rainfall ফিল্ড
+                rainfall: (data.rain && data.rain.mm) !== undefined ? data.rain.mm : data.rainfall
+            };
+
+            bulkUpdates.push({
+                updateOne: {
+                    filter: { uid: uid },
+                    update: {
+                        $set: {
+                            lastSeen: data.timestamp,
+                            status: 'online',
+                            data: deviceData
+                        },
+                        $setOnInsert: {
+                            addedAt: new Date(),
+                            location: null,
+                            name: `Device-${uid}`
+                        }
+                    },
+                    upsert: true
+                }
+            });
+        });
+
+        if (bulkUpdates.length > 0) {
+            await devicesCollection.bulkWrite(bulkUpdates, { ordered: false });
+            io.emit('device-status-updated', Array.from(uniqueDevices.keys()));
+        }
+        
+        console.log(`[Batch] ${dataToInsert.length} records processed.`);
+
+    } catch (error) {
+        console.error('[Batch Error]', error.message);
+        // ফেইল করলে ডাটা আবার বাফারে ফেরত পাঠানো যেতে পারে, তবে মেমরি লিক এড়াতে এখানে ইগনোর করা হলো
+    }
+}
+
+// ২. অফলাইন চেকার
+async function checkOfflineDevices() {
+    if (!db) return;
+    try {
+        const threshold = new Date(Date.now() - OFFLINE_THRESHOLD_MS);
+        const devicesCollection = db.collection('devices');
+
+        const result = await devicesCollection.updateMany(
+            { status: 'online', lastSeen: { $lt: threshold } },
+            { $set: { status: 'offline' } }
+        );
+
+        if (result.modifiedCount > 0) {
+            console.log(`[Offline Monitor] ${result.modifiedCount} devices marked offline.`);
+            // এখানে সকেট ইভেন্ট পাঠানো যেতে পারে রিফ্রেশ করার জন্য
+        }
+    } catch (error) {
+        console.error('[Offline Monitor Error]', error);
+    }
+}
+
+// ৩. পুরনো ব্যাকআপ ক্লিনআপ
+function cleanupBackups() {
+    const NOW = Date.now();
+    backupJobs.forEach((job, id) => {
+        if ((job.status === 'done' || job.status === 'error') && (NOW - job.finishedAt > 3600000)) {
+            if (job.tmpDir) fs.rm(job.tmpDir, { recursive: true, force: true }, () => {});
+            backupJobs.delete(id);
+        }
+    });
+}
+
+// ------------------------------
+// --- রাউটস (Routes) ---
+// ------------------------------
+
+// ১. IoT ডাটা রিসিভার রাউটস
+const iotRouter = express.Router();
+
+iotRouter.post('/esp32pp', (req, res) => { // UTC রিসিভার
+    const data = req.body;
+    // dateTime থাকলে সেটাকেই timestamp হিসেবে ব্যবহার করার চেষ্টা করা
+    if (data.dateTime) {
+        const parsedDate = parseCustomDateTime(data.dateTime);
+        if (parsedDate) {
+            data.timestamp = parsedDate;
+        } else {
+            data.timestamp = data.timestamp ? new Date(data.timestamp) : new Date();
+        }
+    } else {
+        data.timestamp = data.timestamp ? new Date(data.timestamp) : new Date();
+    }
+    
+    data.receivedAt = new Date();
+    espDataBuffer.push(data);
+    res.status(200).send({ message: 'Queued (UTC)' });
+});
+
+iotRouter.post('/esp32p', (req, res) => { // BD Time Zone হ্যান্ডলার
+    const data = req.body;
+    const now = new Date();
+    // সার্ভার টাইম (BDT অনুমান করা হচ্ছে)
+    const bdTime = new Date(now.getTime() + (6 * 60 * 60 * 1000)); 
+    
+    // ১. প্রথমে 'dateTime' ফিল্ড চেক করা (যেমন: "25-12-2025 05:55:00 AM")
+    let finalTimestamp = null;
+    if (data.dateTime) {
+        finalTimestamp = parseCustomDateTime(data.dateTime);
+    }
+
+    // ২. যদি dateTime না থাকে বা পার্স না হয়, তবে 'timestamp' চেক করা
+    if (!finalTimestamp && data.timestamp) {
+        const ts = new Date(data.timestamp);
+        if (!isNaN(ts.getTime())) {
+            finalTimestamp = ts;
+        }
+    }
+
+    // ৩. কিছুই না থাকলে সার্ভার টাইম
+    data.timestamp = finalTimestamp || bdTime;
+    data.receivedAt = bdTime;
+    
+    espDataBuffer.push(data);
+    res.status(200).send({ message: 'Queued (BDT)' });
+});
+
+// ২. পাবলিক ডাটা API
+const publicRouter = express.Router();
+
+publicRouter.get('/device/data', async (req, res) => {
+    try {
+        const { uid, limit } = req.query;
+        const lim = Math.min(1000, parseInt(limit) || 300);
+        const query = uid ? { uid: String(uid) } : {};
+        
+        const data = await req.db.collection('espdata2')
+            .find(query)
+            .sort({ timestamp: -1 })
+            .limit(lim)
+            .project({ 
+                _id: 0, 
+                uid: 1, 
+                timestamp: 1,
+                // নতুন ফিল্ডগুলো প্রোজেকশনে যোগ করা
+                version: 1,
+                pssensor: 1, 
+                environment: 1, 
+                rain: 1,
+                dateTime: 1,
+                // পুরোনো ফিল্ডগুলো (যদি ডাটাবেসে থাকে)
+                temperature: 1, 
+                water_level: 1, 
+                rainfall: 1
+            })
+            .toArray();
+            
+        res.send(data);
+    } catch (e) { res.status(500).send({ error: e.message }); }
+});
+
+// ৩. অথেন্টিকেশন রাউটস
+const authRouter = express.Router();
+
+authRouter.post('/register', async (req, res) => {
+    try {
+        const { name, email, password } = req.body;
+        if (!name || !email || !password) return res.status(400).send({ message: 'All fields required' });
+        
+        const users = req.db.collection('users');
+        const exists = await users.findOne({ email });
+        if (exists) return res.status(400).send({ message: 'Email already exists' });
+
+        const passwordHash = await bcrypt.hash(password, 10);
+        await users.insertOne({
+            name, email, passwordHash,
+            devices: [], createdAt: new Date(), isAdmin: false
+        });
+        
+        res.send({ success: true, message: 'User registered' });
+    } catch (e) { res.status(500).send({ error: e.message }); }
+});
+
+authRouter.post('/login', async (req, res) => {
+    try {
+        const { email, password } = req.body;
+        const user = await req.db.collection('users').findOne({ email });
+        
+        if (!user || !(await bcrypt.compare(password, user.passwordHash))) {
+            return res.status(401).send({ success: false, message: 'Invalid credentials' });
+        }
+
+        const token = jwt.sign({ userId: user._id, email: user.email }, JWT_SECRET, { expiresIn: '7d' });
+        res.send({ success: true, token });
+    } catch (e) { res.status(500).send({ error: e.message }); }
+});
+
+authRouter.post('/password/forgot', async (req, res) => {
+    if (!mailTransporter) return res.status(503).send({ message: 'Email service unavailable' });
+    
+    try {
+        const { email } = req.body;
+        const user = await req.db.collection('users').findOne({ email });
+        
+        // নিরাপত্তা: ইউজার না থাকলেও আমরা বলব ইমেইল পাঠানো হয়েছে
+        if (user) {
+            const tempPass = crypto.randomBytes(4).toString('hex');
+            const hash = await bcrypt.hash(tempPass, 10);
+            
+            await req.db.collection('users').updateOne({ _id: user._id }, { $set: { passwordHash: hash } });
+            
+            await mailTransporter.sendMail({
+                from: process.env.EMAIL_USER,
+                to: email,
+                subject: 'Password Reset',
+                text: `Your new temporary password is: ${tempPass}\nPlease change it immediately.`
+            });
+        }
+        res.send({ success: true, message: 'If account exists, email sent.' });
+    } catch (e) { res.status(500).send({ error: e.message }); }
+});
+
+// ৪. ইউজার প্রোটেক্টেড রাউটস
+const userRouter = express.Router();
+userRouter.use(authenticateJWT);
+
+userRouter.get('/profile', async (req, res) => {
+    const user = await req.db.collection('users').findOne({ _id: new ObjectId(req.user.userId) }, { projection: { passwordHash: 0 } });
+    if(user) user.isAdmin = user.isAdmin || (process.env.ADMIN_EMAIL === user.email);
+    res.send(user || {});
+});
+
+userRouter.get('/devices', async (req, res) => {
+    const user = await req.db.collection('users').findOne({ _id: new ObjectId(req.user.userId) });
+    if (!user || !user.devices) return res.send([]);
+
+    const devices = await req.db.collection('devices').find({ uid: { $in: user.devices } }).toArray();
+    res.send(devices);
+});
+
+userRouter.post('/device/add', async (req, res) => {
+    const { uid } = req.body;
+    if(!uid) return res.status(400).send({message: 'UID needed'});
+    
+    await req.db.collection('users').updateOne(
+        { _id: new ObjectId(req.user.userId) },
+        { $addToSet: { devices: String(uid).trim() } }
+    );
+    res.send({ success: true, message: 'Device Added' });
+});
+
+// ৫. অ্যাডমিন রাউটস
+const adminRouter = express.Router();
+adminRouter.use(authenticateJWT, ensureAdmin);
+
+adminRouter.get('/stats', async (req, res) => {
+    const stats = {
+        totalDevices: await req.db.collection('devices').countDocuments(),
+        onlineDevices: await req.db.collection('devices').countDocuments({ status: 'online' }),
+        totalUsers: await req.db.collection('users').countDocuments(),
+        dbSize: 'Calculating...' 
+    };
+    res.send(stats);
+});
+
+// ডিভাইস আপডেট করার জন্য নতুন রাউট
+adminRouter.put('/device/:uid', async (req, res) => {
+    try {
+        const { uid } = req.params;
+        const { location, name, latitude, longitude, division } = req.body;
+        
+        const updateFields = {};
+        if (location !== undefined) updateFields.location = location;
+        if (name !== undefined) updateFields.name = name;
+        if (latitude !== undefined) updateFields.latitude = latitude;
+        if (longitude !== undefined) updateFields.longitude = longitude;
+        if (division !== undefined) updateFields.division = division;
+
+        if (Object.keys(updateFields).length === 0) {
+            return res.status(400).send({ success: false, message: 'No fields to update.' });
+        }
+
+        const result = await req.db.collection('devices').updateOne(
+            { uid: uid },
+            { $set: updateFields }
+        );
+
+        if (result.matchedCount === 0) {
+            return res.status(404).send({ success: false, message: 'Device not found.' });
+        }
+        
+        if (result.modifiedCount === 0 && result.matchedCount === 1) {
+             return res.send({ success: true, message: 'No changes detected.' });
+        }
+
+        res.send({ success: true, message: `Device ${uid} updated successfully.` });
+    } catch (error) {
+        console.error('Error in /api/admin/device/:uid (PUT):', error);
+        res.status(500).send({ success: false, message: 'Internal server error' });
+    }
+});
+
+// --- রাউটার মাউন্টিং ---
+app.use('/api', iotRouter);       // /api/esp32p...
+app.use('/api/public', publicRouter); // /api/public/device/data
+app.use('/api/user', authRouter); // /api/user/login, /register
+app.use('/api/protected', userRouter); // /api/protected/profile (নাম পরিবর্তন করেছি যাতে কনফ্লিক্ট না হয়)
+app.use('/api/admin', adminRouter);
+
+// রুট রুট
+app.get('/', (req, res) => {
+    res.send(`<h2 style="color:green;text-align:center;">Max IT IoT Server Running</h2>`);
+});
+
+// --- সার্ভার স্টার্টআপ ফাংশন ---
+async function startServer() {
+    try {
+        if (!MONGODB_URI) throw new Error("MONGODB_URI missing in .env");
+        
+        const client = new MongoClient(MONGODB_URI);
+        await client.connect();
+        db = client.db('Esp32data');
+        console.log('[Database] MongoDB Connected Successfully');
+
+        // ইনডেক্স তৈরি (একবার রান হবে)
+        db.collection('espdata2').createIndex({ timestamp: -1 });
+        db.collection('espdata2').createIndex({ uid: 1 });
+        db.collection('users').createIndex({ email: 1 }, { unique: true });
+        db.collection('devices').createIndex({ uid: 1 }, { unique: true });
+
+        // ক্রোন জবস / টাইমার
+        setInterval(processDataBuffer, BATCH_INTERVAL_MS);
+        setInterval(checkOfflineDevices, OFFLINE_CHECK_INTERVAL_MS);
+        setInterval(cleanupBackups, 3600000); // ১ ঘণ্টা পর পর
+
+        // সার্ভার লিসেন
+        http_server.listen(PORT, () => {
+            console.log(`[Server] Running on port ${PORT}`);
+            console.log(`[Time] Server Time: ${new Date().toString()}`);
+        });
+
+    } catch (error) {
+        console.error('[Startup Error]', error);
+        process.exit(1);
+    }
+}
+
+// স্টার্ট!
+startServer();
