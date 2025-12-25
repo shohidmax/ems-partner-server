@@ -104,11 +104,11 @@ const ensureAdmin = async (req, res, next) => {
 };
 
 // --- হেল্পার ফাংশন: কাস্টম ডেট পার্সার ---
-// ইনপুট: "25-12-2025 05:55:00 AM"
+// ইনপুট: "25-12-2025 05:55:00 AM" অথবা "25-12-2025 17:55:00"
 function parseCustomDateTime(dateStr) {
     if (!dateStr || typeof dateStr !== 'string') return null;
     try {
-        const parts = dateStr.split(' '); // ["25-12-2025", "05:55:00", "AM"]
+        const parts = dateStr.split(' '); // ["25-12-2025", "05:55:00", "AM"] or ["25-12-2025", "17:55:00"]
         if (parts.length < 2) return null;
 
         const dateParts = parts[0].split('-'); // ["25", "12", "2025"]
@@ -119,18 +119,30 @@ function parseCustomDateTime(dateStr) {
         let hours = parseInt(timeParts[0], 10);
         const minutes = parseInt(timeParts[1], 10);
         const seconds = parseInt(timeParts[2], 10);
-        const modifier = parts[2]; // AM or PM
+        const day = parseInt(dateParts[0], 10);
+        // JS মাস 0-ভিত্তিক (0 = Jan, 11 = Dec)
+        const month = parseInt(dateParts[1], 10) - 1; 
+        const year = parseInt(dateParts[2], 10);
 
-        if (modifier === 'PM' && hours < 12) hours += 12;
-        if (modifier === 'AM' && hours === 12) hours = 0;
+        const modifier = parts.length > 2 ? parts[2] : null; // AM or PM
 
-        // Note: Months are 0-indexed in JS Date (0 = Jan, 11 = Dec)
-        return new Date(dateParts[2], parseInt(dateParts[1], 10) - 1, dateParts[0], hours, minutes, seconds);
+        if (modifier) {
+            if (modifier.toUpperCase() === 'PM' && hours < 12) hours += 12;
+            if (modifier.toUpperCase() === 'AM' && hours === 12) hours = 0; // Midnight case
+        }
+        
+        if (isNaN(year) || isNaN(month) || isNaN(day) || isNaN(hours) || isNaN(minutes) || isNaN(seconds)) {
+            return null;
+        }
+
+        // new Date(year, month, day, hours, minutes, seconds)
+        return new Date(year, month, day, hours, minutes, seconds);
     } catch (e) {
-        console.error("Date parsing error:", e);
+        console.error("Date parsing error for string:", dateStr, e);
         return null;
     }
 }
+
 
 // ------------------------------
 // --- ব্যাকগ্রাউন্ড প্রসেস ---
@@ -176,12 +188,9 @@ async function processDataBuffer() {
                 rain: data.rain || {},             // { count, mm }
                 
                 // --- Backward Compatibility (যাতে আগের ফ্রন্টএন্ড না ভাঙ্গে) ---
-                // environment.temp অথবা আগের temperature ফিল্ড
-                temperature: (data.environment && data.environment.temp) !== undefined ? data.environment.temp : data.temperature,
-                // pssensor.depth_ft অথবা আগের water_level ফিল্ড
-                water_level: (data.pssensor && data.pssensor.depth_ft) !== undefined ? data.pssensor.depth_ft : data.water_level,
-                // rain.mm অথবা আগের rainfall ফিল্ড
-                rainfall: (data.rain && data.rain.mm) !== undefined ? data.rain.mm : data.rainfall
+                temperature: (data.environment && data.environment.temp !== undefined) ? data.environment.temp : data.temperature,
+                water_level: (data.pssensor && data.pssensor.depth_ft !== undefined) ? data.pssensor.depth_ft : data.water_level,
+                rainfall: (data.rain && data.rain.mm !== undefined) ? data.rain.mm : data.rainfall
             };
 
             bulkUpdates.push({
@@ -209,7 +218,7 @@ async function processDataBuffer() {
             io.emit('device-status-updated', Array.from(uniqueDevices.keys()));
         }
         
-        console.log(`[Batch] ${dataToInsert.length} records processed.`);
+        // console.log(`[Batch] ${dataToInsert.length} records processed.`);
 
     } catch (error) {
         if (error.code !== 11000) { // Ignore duplicate key errors
@@ -225,14 +234,22 @@ async function checkOfflineDevices() {
         const threshold = new Date(Date.now() - OFFLINE_THRESHOLD_MS);
         const devicesCollection = db.collection('devices');
 
-        const result = await devicesCollection.updateMany(
-            { status: 'online', lastSeen: { $lt: threshold } },
-            { $set: { status: 'offline' } }
-        );
+        const offlineDevices = await devicesCollection.find(
+             { status: 'online', lastSeen: { $lt: threshold } },
+             { projection: { uid: 1, _id: 0 } }
+        ).toArray();
 
-        if (result.modifiedCount > 0) {
-            console.log(`[Offline Monitor] ${result.modifiedCount} devices marked offline.`);
-            io.emit('device-status-updated', { type: 'offline-check' });
+        if (offlineDevices.length > 0) {
+            const uidsToUpdate = offlineDevices.map(d => d.uid);
+            const result = await devicesCollection.updateMany(
+                { uid: { $in: uidsToUpdate } },
+                { $set: { status: 'offline' } }
+            );
+
+            if (result.modifiedCount > 0) {
+                console.log(`[Offline Monitor] ${result.modifiedCount} devices marked offline.`);
+                io.emit('device-status-updated', uidsToUpdate);
+            }
         }
     } catch (error) {
         console.error('[Offline Monitor Error]', error);
@@ -261,50 +278,37 @@ function cleanupBackups() {
 // ১. IoT ডাটা রিসিভার রাউটস
 const iotRouter = express.Router();
 
-iotRouter.post('/esp32pp', (req, res) => { // UTC রিসিভার
-    const data = req.body;
-    // dateTime থাকলে সেটাকেই timestamp হিসেবে ব্যবহার করার চেষ্টা করা
-    if (data.dateTime) {
-        const parsedDate = parseCustomDateTime(data.dateTime);
-        if (parsedDate) {
-            data.timestamp = parsedDate;
-        } else {
-            data.timestamp = data.timestamp ? new Date(data.timestamp) : new Date();
-        }
-    } else {
-        data.timestamp = data.timestamp ? new Date(data.timestamp) : new Date();
-    }
-    
-    data.receivedAt = new Date();
-    espDataBuffer.push(data);
-    res.status(200).send({ message: 'Queued (UTC)' });
-});
+const processIncomingData = (data) => {
+    // 1. সবচেয়ে নির্ভরযোগ্য সময় উৎস হলো 'dateTime'
+    let finalTimestamp = parseCustomDateTime(data.dateTime);
 
-iotRouter.post('/esp32p', (req, res) => { // BD Time Zone হ্যান্ডলার
-    const data = req.body;
-    const now = new Date();
-    // সার্ভার টাইম (BDT অনুমান করা হচ্ছে)
-    const bdTime = new Date(now.getTime() + (6 * 60 * 60 * 1000)); 
-    
-    // ১. প্রথমে 'dateTime' ফিল্ড চেক করা (যেমন: "25-12-2025 05:55:00 AM")
-    let finalTimestamp = null;
-    if (data.dateTime) {
-        finalTimestamp = parseCustomDateTime(data.dateTime);
-    }
-
-    // ২. যদি dateTime না থাকে বা পার্স না হয়, তবে 'timestamp' চেক করা
+    // 2. যদি dateTime না থাকে বা পার্স না হয়, তবে 'timestamp' ফিল্ড চেক করা (যদি থাকে)
     if (!finalTimestamp && data.timestamp) {
         const ts = new Date(data.timestamp);
         if (!isNaN(ts.getTime())) {
             finalTimestamp = ts;
         }
     }
-
-    // ৩. কিছুই না থাকলে সার্ভার টাইম
-    data.timestamp = finalTimestamp || bdTime;
-    data.receivedAt = bdTime;
+    
+    // 3. যদি কোনো টাইমস্ট্যাম্প না পাওয়া যায়, তবে সার্ভারের বর্তমান সময় ব্যবহার করা
+    if (!finalTimestamp) {
+        finalTimestamp = new Date();
+    }
+    
+    data.timestamp = finalTimestamp;
+    data.receivedAt = new Date(); // সার্ভার কখন ডেটা পেয়েছে তার সময়
     
     espDataBuffer.push(data);
+};
+
+
+iotRouter.post('/esp32pp', (req, res) => { // UTC রিসিভার
+    processIncomingData(req.body);
+    res.status(200).send({ message: 'Queued (UTC)' });
+});
+
+iotRouter.post('/esp32p', (req, res) => { // BD Time Zone হ্যান্ডলার
+    processIncomingData(req.body);
     res.status(200).send({ message: 'Queued (BDT)' });
 });
 
@@ -778,7 +782,3 @@ async function startServer() {
 
 // স্টার্ট!
 startServer();
-
-    
-
-
