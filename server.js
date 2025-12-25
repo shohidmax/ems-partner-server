@@ -1,4 +1,3 @@
-
 const express = require('express');
 const cors = require('cors');
 const jwt = require('jsonwebtoken');
@@ -213,8 +212,9 @@ async function processDataBuffer() {
         console.log(`[Batch] ${dataToInsert.length} records processed.`);
 
     } catch (error) {
-        console.error('[Batch Error]', error.message);
-        // ফেইল করলে ডাটা আবার বাফারে ফেরত পাঠানো যেতে পারে, তবে মেমরি লিক এড়াতে এখানে ইগনোর করা হলো
+        if (error.code !== 11000) { // Ignore duplicate key errors
+             console.error('[Batch Error]', error.message);
+        }
     }
 }
 
@@ -232,7 +232,7 @@ async function checkOfflineDevices() {
 
         if (result.modifiedCount > 0) {
             console.log(`[Offline Monitor] ${result.modifiedCount} devices marked offline.`);
-            // এখানে সকেট ইভেন্ট পাঠানো যেতে পারে রিফ্রেশ করার জন্য
+            io.emit('device-status-updated', { type: 'offline-check' });
         }
     } catch (error) {
         console.error('[Offline Monitor Error]', error);
@@ -244,7 +244,11 @@ function cleanupBackups() {
     const NOW = Date.now();
     backupJobs.forEach((job, id) => {
         if ((job.status === 'done' || job.status === 'error') && (NOW - job.finishedAt > 3600000)) {
-            if (job.tmpDir) fs.rm(job.tmpDir, { recursive: true, force: true }, () => {});
+            if (job.tmpDir) {
+                fs.rm(job.tmpDir, { recursive: true, force: true }, (err) => {
+                    if (err) console.error(`Failed to clean up backup directory: ${job.tmpDir}`, err);
+                });
+            }
             backupJobs.delete(id);
         }
     });
@@ -672,43 +676,52 @@ adminRouter.post('/backup/start', async (req, res) => {
 });
 
 adminRouter.get('/backup/status/:jobId', (req, res) => {
-    const job = backupJobs.get(req.params.jobId);
-    if(!job) return res.status(404).send({message: 'Not found'});
+    const jobId = req.params.jobId;
+    const token = req.query.token; // Get token from query string for GET request
+
+    if (!token) return res.status(401).send({ message: 'Token missing' });
     
-    res.setHeader('Content-Type', 'text/event-stream');
-    res.setHeader('Cache-Control', 'no-cache');
-    res.setHeader('Connection', 'keep-alive');
+    jwt.verify(token, JWT_SECRET, (err, user) => {
+        if (err) return res.status(403).send({ message: 'Invalid token' });
 
-    const sendEvent = (data) => res.write(`data: ${JSON.stringify(data)}\n\n`);
+        const job = backupJobs.get(jobId);
+        if(!job) return res.status(404).send({message: 'Not found'});
+        
+        res.setHeader('Content-Type', 'text/event-stream');
+        res.setHeader('Cache-Control', 'no-cache');
+        res.setHeader('Connection', 'keep-alive');
 
-    sendEvent({ status: job.status, progress: job.progress, error: job.error });
+        const sendEvent = (data) => res.write(`data: ${JSON.stringify(data)}\n\n`);
 
-    if (job.status === 'done' || job.status === 'error') {
-        if (job.status === 'done') {
-            sendEvent({ status: 'done', progress: 100, download: job.downloadUrl });
-        }
-        return res.end();
-    }
+        sendEvent({ status: job.status, progress: job.progress, error: job.error });
 
-    const iv = setInterval(() => {
-        const currentJob = backupJobs.get(req.params.jobId);
-        if (!currentJob) {
-            clearInterval(iv);
+        if (job.status === 'done' || job.status === 'error') {
+            if (job.status === 'done') {
+                sendEvent({ status: 'done', progress: 100, download: job.downloadUrl });
+            }
             return res.end();
         }
-        
-        sendEvent({ status: currentJob.status, progress: currentJob.progress, error: currentJob.error });
-        
-        if (currentJob.status === 'done' || currentJob.status === 'error') {
-             if (currentJob.status === 'done') {
-                sendEvent({ status: 'done', progress: 100, download: currentJob.downloadUrl });
-            }
-            clearInterval(iv);
-            res.end();
-        }
-    }, 1000);
 
-    req.on('close', () => clearInterval(iv));
+        const iv = setInterval(() => {
+            const currentJob = backupJobs.get(jobId);
+            if (!currentJob) {
+                clearInterval(iv);
+                return res.end();
+            }
+            
+            sendEvent({ status: currentJob.status, progress: currentJob.progress, error: currentJob.error });
+            
+            if (currentJob.status === 'done' || currentJob.status === 'error') {
+                 if (currentJob.status === 'done') {
+                    sendEvent({ status: 'done', progress: 100, download: currentJob.downloadUrl });
+                }
+                clearInterval(iv);
+                res.end();
+            }
+        }, 1000);
+
+        req.on('close', () => clearInterval(iv));
+    });
 });
 
 adminRouter.get('/backup/download/:jobId', (req, res) => {
@@ -720,7 +733,7 @@ adminRouter.get('/backup/download/:jobId', (req, res) => {
 
 // --- রাউটার মাউন্টিং ---
 app.use('/api', iotRouter);
-app.use('/api', publicRouter); 
+app.use('/api/public', publicRouter); 
 app.use('/api/user', authRouter);
 app.use('/api/protected', userRouter);
 app.use('/api/admin', adminRouter);
@@ -762,6 +775,8 @@ async function startServer() {
         process.exit(1);
     }
 }
- 
+
 // স্টার্ট!
 startServer();
+
+    
