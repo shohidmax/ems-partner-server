@@ -1,4 +1,3 @@
-
 const express = require('express');
 const cors = require('cors');
 const jwt = require('jsonwebtoken');
@@ -102,6 +101,8 @@ async function flushDataBuffer(collection, devicesCollection) {
   const dataToInsert = [...espDataBuffer];
   espDataBuffer = []; 
 
+  console.log(`[Batch] Processing ${dataToInsert.length} records...`);
+
   try {
     await collection.insertMany(dataToInsert, { ordered: false });
     
@@ -124,9 +125,9 @@ async function flushDataBuffer(collection, devicesCollection) {
                environment: data.environment || {},
                rain: data.rain || {},
                // ফ্লাট ভ্যালু (লিগ্যাসি সাপোর্টের জন্য)
-               temperature: (data.environment?.temp !== undefined) ? data.environment.temp : data.temperature,
-               water_level: (data.pssensor?.depth_ft !== undefined) ? data.pssensor.depth_ft : data.water_level,
-               rainfall: (data.rain?.mm !== undefined) ? data.rain.mm : data.rainfall
+               temperature: data.temperature || (data.environment?.temp),
+               water_level: data.water_level, 
+               rainfall: data.rainfall
             } 
           });
         }
@@ -166,8 +167,10 @@ async function flushDataBuffer(collection, devicesCollection) {
       await devicesCollection.bulkWrite(bulkOps, { ordered: false });
       io.emit('device-status-updated', updatedDeviceUIDs);
     }
+    console.log(`[Batch] Success.`);
 
   } catch (error) {
+    console.error("[Batch] Error! Restoring buffer:", error.message);
     espDataBuffer = [...dataToInsert, ...espDataBuffer];
   }
 }
@@ -204,6 +207,7 @@ async function checkOfflineDevices(devicesCollection) {
       { uid: { $in: uidsToUpdate } },
       { $set: { status: 'offline' } }
     );
+    console.log(`[Offline] ${uidsToUpdate.length} devices marked offline.`);
     io.emit('device-status-updated', uidsToUpdate);
   } catch (error) { console.error('[Offline] Error:', error.message); }
 }
@@ -307,7 +311,7 @@ async function run() {
         const docs = await EspCollection.find(q)
           .sort({ timestamp: -1 })
           .limit(lim)
-          .project({ uid: 1, pssensor: 1, environment: 1, rain: 1, timestamp: 1, dateTime: 1, temperature: 1, water_level: 1, rainfall: 1, _id: 0 }) 
+          .project({ uid: 1, pssensor: 1, environment: 1, rain: 1, timestamp: 1, dateTime: 1, _id: 0 }) 
           .toArray();
 
         return res.send(docs);
@@ -329,7 +333,7 @@ async function run() {
           const docs = await EspCollection.find({ uid: String(uid), timestamp: { $gte: startDate, $lte: endDate } })
             .sort({ timestamp: 1 })
             .limit(lim)
-            .project({ uid: 1, pssensor: 1, environment: 1, rain: 1, timestamp: 1, dateTime: 1, temperature: 1, water_level: 1, rainfall: 1, _id: 0 })
+            .project({ uid: 1, pssensor: 1, environment: 1, rain: 1, timestamp: 1, dateTime: 1, _id: 0 })
             .toArray();
   
           return res.send(docs);
@@ -344,6 +348,7 @@ async function run() {
         if (!check?.ok) return;
 
         const { uid } = req.params;
+        // আপনার চাওয়া অনুযায়ী সব ফিল্ড আপডেটের অপশন
         const { location, name, division, latitude, longitude } = req.body; 
 
         const updateFields = {};
@@ -359,10 +364,17 @@ async function run() {
         res.send({ success: true, message: result.matchedCount ? 'Updated' : 'Not found' });
     });
 
+    app.get('/api/device/list', authenticateJWT, async (req, res) => {
+        // সব ডিভাইস লিস্ট, সাথে মেটাডাটা
+        const list = await devicesCollection.find({}, { projection: { _id: 0 } }).toArray();
+        res.send(list);
+    });
+
     app.get('/api/user/devices', authenticateJWT, async (req, res) => {
         const user = await usersCollection.findOne({ _id: new ObjectId(req.user.userId) });
         if (!user || !user.devices) return res.send([]);
         
+        // ইউজারের অ্যাসাইন করা ডিভাইসগুলো খুঁজে বের করা
         const devices = await devicesCollection.find({ uid: { $in: user.devices } }).toArray();
         const result = user.devices.map(uid => {
             const d = devices.find(x => x.uid === uid);
@@ -373,20 +385,10 @@ async function run() {
                 division: d?.division,
                 status: d?.status || 'offline',
                 lastSeen: d?.lastSeen,
-                data: d?.data || {} 
+                data: d?.data || {} // কার্ড ভিউ এর জন্য লেটেস্ট ডাটা
             };
         });
         res.send(result);
-    });
-
-    app.post('/api/user/device/add', authenticateJWT, async (req, res) => {
-        const { uid } = req.body;
-        if (!uid) return res.status(400).send({ message: 'UID needed' });
-        await usersCollection.updateOne(
-            { _id: new ObjectId(req.user.userId) },
-            { $addToSet: { devices: String(uid).trim() } }
-        );
-        res.send({ success: true, message: 'Device Added' });
     });
 
     // 5. User & Admin Management
@@ -423,166 +425,12 @@ async function run() {
         res.send(user);
     });
 
-    app.post('/api/user/profile/update', authenticateJWT, async (req, res) => {
-        try {
-            const { name, address, mobile } = req.body;
-            const updateFields = {};
-            if (name) updateFields.name = name;
-            if (address) updateFields.address = address;
-            if (mobile) updateFields.mobile = mobile;
-    
-            if (Object.keys(updateFields).length === 0) {
-                return res.status(400).send({ message: "No fields to update." });
-            }
-            
-            await usersCollection.updateOne({ _id: new ObjectId(req.user.userId) }, { $set: updateFields });
-            res.send({ success: true, message: "Profile updated." });
-        } catch (e) {
-            res.status(500).send({ error: e.message });
-        }
-    });
-
-    app.post('/api/user/password/change', authenticateJWT, async (req, res) => {
-        try {
-            const { oldPassword, newPassword } = req.body;
-            if (!oldPassword || !newPassword) return res.status(400).send({ message: "Old and new passwords are required." });
-    
-            const user = await usersCollection.findOne({ _id: new ObjectId(req.user.userId) });
-            if (!user) return res.status(404).send({ message: "User not found." });
-    
-            const isMatch = await bcrypt.compare(oldPassword, user.passwordHash);
-            if (!isMatch) return res.status(401).send({ message: "Invalid old password." });
-            
-            const newPasswordHash = await bcrypt.hash(newPassword, 10);
-            await usersCollection.updateOne({ _id: user._id }, { $set: { passwordHash: newPasswordHash } });
-    
-            res.send({ success: true, message: 'Password changed successfully.' });
-        } catch (e) {
-            res.status(500).send({ error: e.message });
-        }
-    });
-
     // Admin: List Users
     app.get('/api/admin/users', authenticateJWT, async (req, res) => {
         const check = await ensureAdmin(req, res);
         if (!check?.ok) return;
         const users = await usersCollection.find({}, { projection: { passwordHash: 0 } }).toArray();
         res.send(users);
-    });
-
-    // Admin: List all devices with owners
-    app.get('/api/admin/devices', authenticateJWT, async (req, res) => {
-        const check = await ensureAdmin(req, res);
-        if (!check?.ok) return;
-
-        try {
-            const devices = await devicesCollection.find({}).toArray();
-            const allDeviceUIDs = devices.map(d => d.uid);
-    
-            const users = await usersCollection.find(
-                { devices: { $in: allDeviceUIDs } },
-                { projection: { _id: 1, name: 1, email: 1, devices: 1 } }
-            ).toArray();
-    
-            const userMap = new Map();
-            users.forEach(user => {
-                user.devices.forEach(uid => {
-                    if (!userMap.has(uid)) userMap.set(uid, []);
-                    userMap.get(uid).push({ _id: user._id, name: user.name, email: user.email });
-                });
-            });
-    
-            const result = devices.map(device => ({
-                ...device,
-                owners: userMap.get(device.uid) || []
-            }));
-    
-            res.send(result);
-        } catch (error) {
-            res.status(500).send({ success: false, message: 'Internal server error' });
-        }
-    });
-
-    // Admin: Stats
-    app.get('/api/admin/stats', authenticateJWT, async (req, res) => {
-      const check = await ensureAdmin(req, res);
-      if (!check?.ok) return;
-      try {
-        const stats = {
-            totalDevices: await devicesCollection.countDocuments(),
-            onlineDevices: await devicesCollection.countDocuments({ status: 'online' }),
-            totalUsers: await usersCollection.countDocuments()
-        };
-        res.send(stats);
-      } catch(e) {
-        res.status(500).send({ message: 'Error fetching stats'});
-      }
-    });
-
-    // Admin: Reports
-    app.get('/api/admin/report', authenticateJWT, async (req, res) => {
-        const check = await ensureAdmin(req, res);
-        if (!check?.ok) return;
-
-        const { period = 'monthly', year = new Date().getFullYear().toString() } = req.query;
-        let group, sort;
-        const matchYear = parseInt(year, 10);
-
-        switch (period) {
-            case 'daily':
-                group = {
-                    _id: { $dateToString: { format: '%Y-%m-%d', date: '$timestamp', timeZone: 'Asia/Dhaka' } },
-                    avgTemp: { $avg: '$environment.temp' },
-                    avgRain: { $sum: '$rain.mm' },
-                    count: { $sum: 1 }
-                };
-                sort = { '_id': 1 };
-                break;
-            case 'yearly':
-                group = {
-                    _id: { $year: { date: '$timestamp', timeZone: 'Asia/Dhaka' } },
-                    avgTemp: { $avg: '$environment.temp' },
-                    avgRain: { $sum: '$rain.mm' },
-                    count: { $sum: 1 }
-                };
-                sort = { '_id': 1 };
-                break;
-            case 'monthly':
-            default:
-                group = {
-                    _id: { $dateToString: { format: '%Y-%m', date: '$timestamp', timeZone: 'Asia/Dhaka' } },
-                    avgTemp: { $avg: '$environment.temp' },
-                    avgRain: { $sum: '$rain.mm' },
-                    count: { $sum: 1 }
-                };
-                sort = { '_id': 1 };
-        }
-
-        try {
-            const data = await EspCollection.aggregate([
-                { $match: { 
-                    timestamp: { 
-                        $gte: new Date(matchYear, 0, 1), 
-                        $lt: new Date(matchYear + 1, 0, 1)
-                    },
-                    'environment.temp': { $ne: 85 } // Ignore error value
-                } },
-                { $group: group },
-                { $sort: sort },
-                { $project: {
-                    _id: 0,
-                    date: period === 'daily' ? '$_id' : undefined,
-                    month: period === 'monthly' ? '$_id' : undefined,
-                    year: period === 'yearly' ? '$_id' : undefined,
-                    avgTemp: 1,
-                    avgRain: 1,
-                    count: 1
-                }}
-            ]).toArray();
-            res.json(data);
-        } catch (e) {
-            res.status(500).send({ error: e.message });
-        }
     });
 
     // Admin: Promote/Demote
@@ -618,10 +466,7 @@ async function run() {
     });
 
     // 6. Backup System (Same as before)
-    app.post('/api/backup/start', authenticateJWT, async (req, res) => {
-        const check = await ensureAdmin(req, res);
-        if (!check?.ok) return;
-
+    app.post('/api/backup/start', async (req, res) => {
         const { uid } = req.body;
         const q = uid ? { uid: String(uid) } : {};
         const jobId = randomUUID();
@@ -630,8 +475,6 @@ async function run() {
         
         const job = { status: 'pending', progress: 0, tmpDir, zipPath: path.join(tmpDir, 'espdata.zip') };
         backupJobs.set(jobId, job);
-
-        res.send({ jobId });
 
         (async () => {
             try {
@@ -663,59 +506,29 @@ async function run() {
                 await new Promise(r => output.on('close', r));
 
                 job.status = 'done'; job.progress = 100; job.finishedAt = new Date();
-                 const downloadPath = `/api/backup/download/${jobId}`;
-                 job.downloadUrl = downloadPath; 
-
-            } catch (err) { job.status = 'error'; job.error = err.message; job.finishedAt = new Date(); }
+            } catch (err) { job.status = 'error'; job.error = err.message; }
         })();
+        res.send({ jobId });
     });
 
-    app.get('/api/backup/status/:jobId', authenticateJWT, (req, res) => {
+    app.get('/api/backup/status/:jobId', (req, res) => {
         const job = backupJobs.get(req.params.jobId);
         if(!job) return res.status(404).send({message: 'Not found'});
-        
         res.setHeader('Content-Type', 'text/event-stream');
         res.setHeader('Cache-Control', 'no-cache');
         res.setHeader('Connection', 'keep-alive');
-
-        const sendEvent = (data) => res.write(`data: ${JSON.stringify(data)}\n\n`);
-
-        sendEvent({ status: job.status, progress: job.progress, error: job.error });
-
-        if (job.status === 'done' || job.status === 'error') {
-            if (job.status === 'done') {
-                sendEvent({ status: 'done', progress: 100, download: job.downloadUrl });
-            }
-            return res.end();
-        }
-
         const iv = setInterval(() => {
-            const currentJob = backupJobs.get(req.params.jobId);
-            if (!currentJob) {
-                clearInterval(iv);
-                return res.end();
-            }
-            
-            sendEvent({ status: currentJob.status, progress: currentJob.progress, error: currentJob.error });
-            
-            if (currentJob.status === 'done' || currentJob.status === 'error') {
-                 if (currentJob.status === 'done') {
-                    sendEvent({ status: 'done', progress: 100, download: currentJob.downloadUrl });
-                }
-                clearInterval(iv);
-                res.end();
-            }
+            const j = backupJobs.get(req.params.jobId);
+            if (!j) { clearInterval(iv); return res.end(); }
+            res.write(`data: ${JSON.stringify({ status: j.status, progress: j.progress, error: j.error })}\n\n`);
+            if (j.status === 'done' || j.status === 'error') { clearInterval(iv); res.end(); }
         }, 1000);
-
         req.on('close', () => clearInterval(iv));
     });
 
-    app.get('/api/backup/download/:jobId', authenticateJWT, (req, res) => {
-        const check = ensureAdmin(req, res);
-        if(!check) return;
-
+    app.get('/api/backup/download/:jobId', (req, res) => {
         const job = backupJobs.get(req.params.jobId);
-        if (!job || job.status !== 'done') return res.status(400).send('Not ready or invalid job ID');
+        if (!job || job.status !== 'done') return res.status(400).send('Not ready');
         res.download(job.zipPath, 'espdata.zip');
     });
 
@@ -729,6 +542,3 @@ app.get("/", (req, res) => res.send(`<h1 style="text-align: center; color: green
 http_server.listen(port, () => {
   console.log(`Max it Production server running at: ${port}`);
 });
-
-
-    
