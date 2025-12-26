@@ -26,7 +26,7 @@ const MONGODB_URI = process.env.MONGODB_URI;
 const BATCH_INTERVAL_MS = 10000;       // ১০ সেকেন্ড
 const DEVICE_SYNC_INTERVAL_MS = 600000; // ১০ মিনিট
 const OFFLINE_CHECK_INTERVAL_MS = 60000; // ১ মিনিট
-const OFFLINE_THRESHOLD_MS = 600000;    // ১০ মিনিট
+const OFFLINE_THRESHOLD_MS = 1800000;    // ৩০ মিনিট
 
 // গ্লোবাল ভেরিয়েবল
 let db;
