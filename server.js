@@ -326,6 +326,10 @@ publicRouter.post('/device/data-by-range', authenticateJWT, async (req, res) => 
         const endDate = end ? new Date(end) : new Date();
         const lim = Math.min(20000, Math.max(1, parseInt(limit, 10) || 10000));
 
+        if (isNaN(startDate.getTime()) || isNaN(endDate.getTime())) {
+            return res.status(400).send({ success: false, message: 'Invalid date format' });
+        }
+
         const docs = await req.db.collection('espdata2').find({ uid: String(uid), timestamp: { $gte: startDate, $lte: endDate } })
           .sort({ timestamp: 1 })
           .limit(lim)
