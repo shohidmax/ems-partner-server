@@ -1,3 +1,4 @@
+
 const express = require('express');
 const cors = require('cors');
 const jwt = require('jsonwebtoken');
@@ -136,7 +137,7 @@ function parseCustomDateTime(dateStr) {
         }
 
         // new Date(year, month, day, hours, minutes, seconds)
-        return new Date(year, month, day, hours, minutes, seconds);
+        return new Date(Date.UTC(year, month, day, hours, minutes, seconds));
     } catch (e) {
         console.error("Date parsing error for string:", dateStr, e);
         return null;
@@ -189,6 +190,7 @@ async function processDataBuffer() {
                 
                 // --- Backward Compatibility (যাতে আগের ফ্রন্টএন্ড না ভাঙ্গে) ---
                 temperature: (data.environment && data.environment.temp !== undefined) ? data.environment.temp : data.temperature,
+                humidity: (data.environment && data.environment.hum !== undefined) ? data.environment.hum : null,
                 water_level: (data.pssensor && data.pssensor.depth_ft !== undefined) ? data.pssensor.depth_ft : data.water_level,
                 rainfall: (data.rain && data.rain.mm !== undefined) ? data.rain.mm : data.rainfall
             };
@@ -315,7 +317,7 @@ iotRouter.post('/esp32p', (req, res) => { // BD Time Zone হ্যান্ড�
 // ২. পাবলিক ডাটা API
 const publicRouter = express.Router();
 
-publicRouter.post('/device/data-by-range', async (req, res) => {
+publicRouter.post('/device/data-by-range', authenticateJWT, async (req, res) => {
     try {
         const { uid, start, end, limit } = req.body || {};
         if (!uid) return res.status(400).send({ success: false, message: 'uid is required' });
@@ -399,27 +401,6 @@ authRouter.post('/password/forgot', async (req, res) => {
 });
 
 
-authRouter.post('/password/change', authenticateJWT, async (req, res) => {
-    try {
-        const { oldPassword, newPassword } = req.body;
-        if (!oldPassword || !newPassword) return res.status(400).send({ message: "Old and new passwords are required." });
-
-        const user = await req.db.collection('users').findOne({ _id: new ObjectId(req.user.userId) });
-        if (!user) return res.status(404).send({ message: "User not found." });
-
-        const isMatch = await bcrypt.compare(oldPassword, user.passwordHash);
-        if (!isMatch) return res.status(401).send({ message: "Invalid old password." });
-        
-        const newPasswordHash = await bcrypt.hash(newPassword, 10);
-        await req.db.collection('users').updateOne({ _id: user._id }, { $set: { passwordHash: newPasswordHash } });
-
-        res.send({ success: true, message: 'Password changed successfully.' });
-    } catch (e) {
-        res.status(500).send({ error: e.message });
-    }
-});
-
-
 // ৪. ইউজার প্রোটেক্টেড রাউটস
 const userRouter = express.Router();
 userRouter.use(authenticateJWT);
@@ -468,6 +449,27 @@ userRouter.post('/device/add', async (req, res) => {
     );
     res.send({ success: true, message: 'Device Added' });
 });
+
+userRouter.post('/password/change', async (req, res) => {
+    try {
+        const { oldPassword, newPassword } = req.body;
+        if (!oldPassword || !newPassword) return res.status(400).send({ message: "Old and new passwords are required." });
+
+        const user = await req.db.collection('users').findOne({ _id: new ObjectId(req.user.userId) });
+        if (!user) return res.status(404).send({ message: "User not found." });
+
+        const isMatch = await bcrypt.compare(oldPassword, user.passwordHash);
+        if (!isMatch) return res.status(401).send({ message: "Invalid old password." });
+        
+        const newPasswordHash = await bcrypt.hash(newPassword, 10);
+        await req.db.collection('users').updateOne({ _id: user._id }, { $set: { passwordHash: newPasswordHash } });
+
+        res.send({ success: true, message: 'Password changed successfully.' });
+    } catch (e) {
+        res.status(500).send({ error: e.message });
+    }
+});
+
 
 // ৫. অ্যাডমিন রাউটস
 const adminRouter = express.Router();
@@ -738,8 +740,8 @@ adminRouter.get('/backup/download/:jobId', (req, res) => {
 // --- রাউটার মাউন্টিং ---
 app.use('/api', iotRouter);
 app.use('/api/public', publicRouter); 
-app.use('/api/user', authRouter);
-app.use('/api/protected', userRouter);
+app.use('/api/auth', authRouter);
+app.use('/api/user', userRouter);
 app.use('/api/admin', adminRouter);
 
 // রুট রুট
@@ -782,3 +784,5 @@ async function startServer() {
 
 // স্টার্ট!
 startServer();
+
+    
