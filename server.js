@@ -105,43 +105,21 @@ const ensureAdmin = async (req, res, next) => {
 };
 
 // --- হেল্পার ফাংশন: কাস্টম ডেট পার্সার ---
-// ইনপুট: "25-12-2025 05:55:00 AM" অথবা "25-12-2025 17:55:00"
-function parseCustomDateTime(dateStr) {
-    if (!dateStr || typeof dateStr !== 'string') return null;
-    try {
-        const parts = dateStr.split(' '); // ["25-12-2025", "05:55:00", "AM"] or ["25-12-2025", "17:55:00"]
-        if (parts.length < 2) return null;
-
-        const dateParts = parts[0].split('-'); // ["25", "12", "2025"]
-        const timeParts = parts[1].split(':'); // ["05", "55", "00"]
-        
-        if (dateParts.length !== 3 || timeParts.length !== 3) return null;
-
-        let hours = parseInt(timeParts[0], 10);
-        const minutes = parseInt(timeParts[1], 10);
-        const seconds = parseInt(timeParts[2], 10);
-        const day = parseInt(dateParts[0], 10);
-        // JS মাস 0-ভিত্তিক (0 = Jan, 11 = Dec)
-        const month = parseInt(dateParts[1], 10) - 1; 
-        const year = parseInt(dateParts[2], 10);
-
-        const modifier = parts.length > 2 ? parts[2] : null; // AM or PM
-
-        if (modifier) {
-            if (modifier.toUpperCase() === 'PM' && hours < 12) hours += 12;
-            if (modifier.toUpperCase() === 'AM' && hours === 12) hours = 0; // Midnight case
-        }
-        
-        if (isNaN(year) || isNaN(month) || isNaN(day) || isNaN(hours) || isNaN(minutes) || isNaN(seconds)) {
-            return null;
-        }
-
-        // new Date(year, month, day, hours, minutes, seconds)
-        return new Date(Date.UTC(year, month, day, hours, minutes, seconds));
-    } catch (e) {
-        console.error("Date parsing error for string:", dateStr, e);
-        return null;
+// এখন থেকে এই ফাংশন শুধুমাত্র dateTime স্ট্রিংটি সরাসরি timestamp হিসেবে ব্যবহার করবে
+function parseAndAssignTimestamp(data) {
+    // 1. dateTime ফিল্ডকে timestamp হিসেবে ব্যবহার করা
+    if (data.dateTime && typeof data.dateTime === 'string') {
+        data.timestamp = data.dateTime;
+    } 
+    // 2. যদি dateTime না থাকে, তবে সার্ভারের বর্তমান সময়কে Date অবজেক্ট হিসেবে ব্যবহার করা
+    else {
+        data.timestamp = new Date();
     }
+    
+    // 3. সার্ভার কখন ডেটা পেয়েছে তার সময়
+    data.receivedAt = new Date();
+    
+    return data;
 }
 
 
@@ -173,8 +151,9 @@ async function processDataBuffer() {
         // ডুপ্লিকেট এড়িয়ে লেটেস্ট ডাটা বের করা
         dataToInsert.forEach(d => {
             if (d.uid) {
-                const ts = new Date(d.timestamp);
-                if (!uniqueDevices.has(d.uid) || ts > uniqueDevices.get(d.uid).timestamp) {
+                // receivedAt ব্যবহার করা হচ্ছে, কারণ timestamp এখন স্ট্রিং
+                const ts = new Date(d.receivedAt);
+                if (!uniqueDevices.has(d.uid) || ts > new Date(uniqueDevices.get(d.uid).receivedAt)) {
                     uniqueDevices.set(d.uid, d);
                 }
             }
@@ -200,7 +179,7 @@ async function processDataBuffer() {
                     filter: { uid: uid },
                     update: {
                         $set: {
-                            lastSeen: data.timestamp,
+                            lastSeen: data.receivedAt, // lastSeen এখন Date অবজেক্ট
                             status: 'online',
                             data: deviceData
                         },
@@ -281,26 +260,8 @@ function cleanupBackups() {
 const iotRouter = express.Router();
 
 const processIncomingData = (data) => {
-    // 1. সবচেয়ে নির্ভরযোগ্য সময় উৎস হলো 'dateTime'
-    let finalTimestamp = parseCustomDateTime(data.dateTime);
-
-    // 2. যদি dateTime না থাকে বা পার্স না হয়, তবে 'timestamp' ফিল্ড চেক করা (যদি থাকে)
-    if (!finalTimestamp && data.timestamp) {
-        const ts = new Date(data.timestamp);
-        if (!isNaN(ts.getTime())) {
-            finalTimestamp = ts;
-        }
-    }
-    
-    // 3. যদি কোনো টাইমস্ট্যাম্প না পাওয়া যায়, তবে সার্ভারের বর্তমান সময় ব্যবহার করা
-    if (!finalTimestamp) {
-        finalTimestamp = new Date();
-    }
-    
-    data.timestamp = finalTimestamp;
-    data.receivedAt = new Date(); // সার্ভার কখন ডেটা পেয়েছে তার সময়
-    
-    espDataBuffer.push(data);
+    const processedData = parseAndAssignTimestamp(data);
+    espDataBuffer.push(processedData);
 };
 
 
@@ -322,22 +283,28 @@ publicRouter.post('/device/data-by-range', authenticateJWT, async (req, res) => 
         const { uid, start, end, limit } = req.body || {};
         if (!uid) return res.status(400).send({ success: false, message: 'uid is required' });
 
-        const startDate = start ? new Date(start) : new Date(0);
-        const endDate = end ? new Date(end) : new Date();
-        const lim = Math.min(20000, Math.max(1, parseInt(limit, 10) || 10000));
-
-        if (isNaN(startDate.getTime()) || isNaN(endDate.getTime())) {
-            return res.status(400).send({ success: false, message: 'Invalid date format' });
+        // ফিল্টারিং এর জন্য receivedAt (Date object) ব্যবহার করা হচ্ছে
+        const query = { uid: String(uid) };
+        if (start && end) {
+            const startDate = new Date(start);
+            const endDate = new Date(end);
+             if (isNaN(startDate.getTime()) || isNaN(endDate.getTime())) {
+                return res.status(400).send({ success: false, message: 'Invalid date format for start/end' });
+            }
+            query.receivedAt = { $gte: startDate, $lte: endDate };
         }
-
-        const docs = await req.db.collection('espdata2').find({ uid: String(uid), timestamp: { $gte: startDate, $lte: endDate } })
-          .sort({ timestamp: 1 })
+        
+        const lim = Math.min(20000, Math.max(1, parseInt(limit, 10) || 10000));
+        
+        const docs = await req.db.collection('espdata2').find(query)
+          .sort({ receivedAt: 1 }) // receivedAt দিয়ে সাজানো
           .limit(lim)
           .project({ uid: 1, pssensor: 1, environment: 1, rain: 1, timestamp: 1, dateTime: 1, temperature: 1, water_level: 1, rainfall: 1, _id: 0 })
           .toArray();
 
         return res.send(docs);
     } catch (error) {
+        console.error('Error in /data-by-range:', error);
         return res.status(500).send({ success: false, message: 'Server error' });
     }
 });
@@ -579,10 +546,18 @@ adminRouter.get('/report', async (req, res) => {
     let group, sort;
     const matchYear = parseInt(year, 10);
 
+    const matchStage = { 
+        receivedAt: { 
+            $gte: new Date(matchYear, 0, 1), 
+            $lt: new Date(matchYear + 1, 0, 1)
+        },
+        'environment.temp': { $ne: 85 } // Ignore error value
+    };
+
     switch (period) {
         case 'daily':
             group = {
-                _id: { $dateToString: { format: '%Y-%m-%d', date: '$timestamp', timeZone: 'Asia/Dhaka' } },
+                _id: { $dateToString: { format: '%Y-%m-%d', date: '$receivedAt', timeZone: 'Asia/Dhaka' } },
                 avgTemp: { $avg: '$environment.temp' },
                 avgRain: { $sum: '$rain.mm' },
                 count: { $sum: 1 }
@@ -591,7 +566,7 @@ adminRouter.get('/report', async (req, res) => {
             break;
         case 'yearly':
             group = {
-                _id: { $year: { date: '$timestamp', timeZone: 'Asia/Dhaka' } },
+                _id: { $year: { date: '$receivedAt', timeZone: 'Asia/Dhaka' } },
                 avgTemp: { $avg: '$environment.temp' },
                 avgRain: { $sum: '$rain.mm' },
                 count: { $sum: 1 }
@@ -601,7 +576,7 @@ adminRouter.get('/report', async (req, res) => {
         case 'monthly':
         default:
             group = {
-                _id: { $dateToString: { format: '%Y-%m', date: '$timestamp', timeZone: 'Asia/Dhaka' } },
+                _id: { $dateToString: { format: '%Y-%m', date: '$receivedAt', timeZone: 'Asia/Dhaka' } },
                 avgTemp: { $avg: '$environment.temp' },
                 avgRain: { $sum: '$rain.mm' },
                 count: { $sum: 1 }
@@ -611,13 +586,7 @@ adminRouter.get('/report', async (req, res) => {
 
     try {
         const data = await req.db.collection('espdata2').aggregate([
-            { $match: { 
-                timestamp: { 
-                    $gte: new Date(matchYear, 0, 1), 
-                    $lt: new Date(matchYear + 1, 0, 1)
-                },
-                'environment.temp': { $ne: 85 } // Ignore error value
-            } },
+            { $match: matchStage },
             { $group: group },
             { $sort: sort },
             { $project: {
@@ -655,12 +624,13 @@ adminRouter.post('/backup/start', async (req, res) => {
             const out = fs.createWriteStream(path.join(tmpDir, 'espdata.json'), { encoding: 'utf8' });
             out.write('[');
             let first = true, written = 0;
-            for await (const doc of req.db.collection('espdata2').find(q).sort({ timestamp: 1 })) {
+            for await (const doc of req.db.collection('espdata2').find(q).sort({ receivedAt: 1 })) {
                 if (!first) out.write(',');
                 // Clean Output
                 const clean = { 
                     uid: doc.uid, timestamp: doc.timestamp, dateTime: doc.dateTime,
-                    pssensor: doc.pssensor, environment: doc.environment, rain: doc.rain
+                    pssensor: doc.pssensor, environment: doc.environment, rain: doc.rain,
+                    receivedAt: doc.receivedAt
                 };
                 out.write(JSON.stringify(clean));
                 first = false; written++;
@@ -764,7 +734,7 @@ async function startServer() {
         console.log('[Database] MongoDB Connected Successfully');
 
         // ইনডেক্স তৈরি (একবার রান হবে)
-        db.collection('espdata2').createIndex({ timestamp: -1 });
+        db.collection('espdata2').createIndex({ receivedAt: -1 });
         db.collection('espdata2').createIndex({ uid: 1 });
         db.collection('users').createIndex({ email: 1 }, { unique: true });
         db.collection('devices').createIndex({ uid: 1 }, { unique: true });
@@ -788,5 +758,7 @@ async function startServer() {
 
 // স্টার্ট!
 startServer();
+
+    
 
     
