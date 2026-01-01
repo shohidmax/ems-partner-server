@@ -489,14 +489,14 @@ adminRouter.get('/devices', async (req, res) => {
 adminRouter.put('/device/:uid', async (req, res) => {
     try {
         const { uid } = req.params;
-        const { location, name, latitude, longitude, division } = req.body;
+        const { location, name, latitude, longitude, institution } = req.body;
         
         const updateFields = {};
         if (location !== undefined) updateFields.location = location;
         if (name !== undefined) updateFields.name = name;
         if (latitude !== undefined) updateFields.latitude = latitude;
         if (longitude !== undefined) updateFields.longitude = longitude;
-        if (division !== undefined) updateFields.division = division;
+        if (institution !== undefined) updateFields.institution = institution;
 
         if (Object.keys(updateFields).length === 0) {
             return res.status(400).send({ success: false, message: 'No fields to update.' });
@@ -758,6 +758,8 @@ async function startServer() {
 
 // স্টার্ট!
 startServer();
+
+    
 
     
 
