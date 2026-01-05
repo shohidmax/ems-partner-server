@@ -28,7 +28,7 @@ const DEVICE_SYNC_INTERVAL_MS = 600000; // ১০ মিনিট
 const OFFLINE_CHECK_INTERVAL_MS = 60000; // ১ মিনিট
 const OFFLINE_THRESHOLD_MS = 1800000;    // ৩০ মিনিট
 
-// গ্লোবাল ভেরিয়েবল     
+// গ্লোবাল ভেরিয়েবল ডিক্লারেশন
 let db;
 let espDataBuffer = [];
 const backupJobs = new Map();
@@ -377,17 +377,9 @@ const userRouter = express.Router();
 userRouter.use(authenticateJWT);
 
 userRouter.get('/profile', async (req, res) => {
-    try {
-        const user = await req.db.collection('users').findOne({ _id: new ObjectId(req.user.userId) }, { projection: { passwordHash: 0 } });
-        if (user) {
-            user.isAdmin = user.isAdmin || (process.env.ADMIN_EMAIL === user.email);
-            res.send(user);
-        } else {
-            res.status(404).send({ message: "User not found." });
-        }
-    } catch(e) {
-        res.status(500).send({ message: 'Internal server error fetching profile.'});
-    }
+    const user = await req.db.collection('users').findOne({ _id: new ObjectId(req.user.userId) }, { projection: { passwordHash: 0 } });
+    if(user) user.isAdmin = user.isAdmin || (process.env.ADMIN_EMAIL === user.email);
+    res.send(user || {});
 });
 
 userRouter.post('/profile/update', async (req, res) => {
@@ -772,4 +764,3 @@ startServer();
     
 
     
-
